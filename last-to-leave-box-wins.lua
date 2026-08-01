@@ -32,6 +32,8 @@
 	https://ghost-vast-stag.ngrok-free.app/api/debug - the ngrok tunnel
 	forwards to the local debug_server.py on port 8123. Successful POSTs
 	are confirmed ("posted" marker); failures show up on the status line.
+	Every payload is also appended to last-to-leave-box-debug.jsonl in the
+	executor workspace (appendfile/writefile) as a no-network fallback.
 
 	Buttons: [Scan] dumps game state + posts to the debug server, [Bot]
 	toggles, [Remove] tears down. RightShift toggles the bot.
@@ -305,45 +307,68 @@ local function responseConfirmed(resp)
 	return false
 end
 
--- Executors vary in which HTTP calls they hook, so try every known form.
-local function tryHttpPost(url, body)
-	local strategies = {
-		function()
-			return game:HttpGet(url, false, { ["Content-Type"] = "application/json" }, "POST", body)
-		end,
-		function()
-			return game:HttpGet(url, "POST", body)
-		end,
-		function()
-			return game:HttpPost(url, body, "application/json")
-		end,
-		function()
-			return game:GetService("HttpService"):PostAsync(url, body, "application/json")
-		end,
-	}
-	if request ~= nil then
-		table.insert(strategies, function()
-			return request({
-				Url = url,
-				Method = "POST",
-				Headers = { ["Content-Type"] = "application/json" },
-				Body = body,
-			})
+-- Executors vary in which HTTP calls they hook, so try every known form
+-- against every candidate URL (public tunnel first, then localhost).
+local function tryHttpPost(urls, body)
+	local lastErrs = {}
+	for ui = 1, #urls do
+		local u = urls[ui]
+		local strategies = {
+			function()
+				return game:HttpGet(u, false, { ["Content-Type"] = "application/json" }, "POST", body)
+			end,
+			function()
+				return game:HttpGet(u, "POST", body)
+			end,
+			function()
+				return game:HttpPost(u, body, "application/json")
+			end,
+			function()
+				return game:GetService("HttpService"):PostAsync(u, body, "application/json")
+			end,
+		}
+		if request ~= nil then
+			table.insert(strategies, function()
+				return request({
+					Url = u,
+					Method = "POST",
+					Headers = { ["Content-Type"] = "application/json" },
+					Body = body,
+				})
+			end)
+		end
+		for i = 1, #strategies do
+			local ok, resp = pcall(strategies[i])
+			if ok and responseConfirmed(resp) then
+				return true, nil
+			end
+			if ok then
+				lastErrs[#lastErrs + 1] = u .. " -> method " .. i .. " unconfirmed"
+			else
+				lastErrs[#lastErrs + 1] = u .. " -> " .. tostring(resp)
+			end
+		end
+	end
+	return false, table.concat(lastErrs, " | ")
+end
+
+-- Local file fallback: if every HTTP route fails, keep the same payloads in
+-- the executor's workspace so no data is lost.
+local function logToFile(line)
+	if appendfile ~= nil then
+		pcall(function() appendfile("last-to-leave-box-debug.jsonl", line .. "\n") end)
+	elseif writefile ~= nil then
+		pcall(function()
+			local existing = ""
+			if readfile ~= nil then
+				local ok, data = pcall(readfile, "last-to-leave-box-debug.jsonl")
+				if ok and data ~= nil then
+					existing = data
+				end
+			end
+			writefile("last-to-leave-box-debug.jsonl", existing .. line .. "\n")
 		end)
 	end
-	local lastErr = nil
-	for i = 1, #strategies do
-		local ok, resp = pcall(strategies[i])
-		if ok and responseConfirmed(resp) then
-			return true, i
-		end
-		if ok then
-			lastErr = "strategy " .. i .. " returned an unconfirmed response"
-		else
-			lastErr = resp
-		end
-	end
-	return false, lastErr
 end
 
 local function sendDebug(snapshot, texts, phase, message, reason)
@@ -356,11 +381,17 @@ local function sendDebug(snapshot, texts, phase, message, reason)
 		url = cfg.debugUrl
 	end
 
+	local urls = { url }
+	if url ~= "http://127.0.0.1:8123/api/debug" then
+		urls[#urls + 1] = "http://127.0.0.1:8123/api/debug"
+	end
+
 	local payload = buildPayload(snapshot, texts, phase, message, reason)
 	local body = jsonEncode(payload)
 
 	local function post()
-		local ok, err = tryHttpPost(url, body)
+		local ok, err = tryHttpPost(urls, body)
+		pcall(logToFile, body)
 		if ok then
 			if reason == "scan" then
 				flashMessage("Scan sent - posted to the debug server")
@@ -368,17 +399,15 @@ local function sendDebug(snapshot, texts, phase, message, reason)
 			return
 		end
 		warn("[LastToLeaveBox] debug send failed:", tostring(err))
-		if reason == "scan" then
-			flashMessage("Scan failed to post: " .. tostring(err))
-		else
-			flashMessage("debug POST failed: " .. tostring(err))
+		if reason == "scan" or reason == "phase-change" then
+			flashMessage("debug POST failed: " .. string.sub(tostring(err), 1, 120))
 		end
 	end
 
 	local ok2, err2 = pcall(delay, 0, post)
 	if not ok2 then
 		warn("[LastToLeaveBox] debug send error:", tostring(err2))
-		wallState.message = "debug send error: " .. tostring(err2)
+		wallState.message = "debug send error: " .. string.sub(tostring(err2), 1, 120)
 	end
 end
 
@@ -592,6 +621,23 @@ local function detectPhase(snapshot, texts)
 		return string.find(combined, keyword, 1, true) ~= nil
 	end
 
+	-- A hazard challenge (fly-up) only counts when ONE label pairs the
+	-- hazard word with an action word, so a lobby/menu mention of "lava",
+	-- "laser", "abyss" or "tiles" can't trigger a lethal fly-up.
+	local function hazardMatch(hazard, actions)
+		for _, t in ipairs(texts) do
+			local tl = lower(t)
+			if string.find(tl, hazard, 1, true) ~= nil then
+				for _, act in ipairs(actions) do
+					if string.find(tl, act, 1, true) ~= nil then
+						return true
+					end
+				end
+			end
+		end
+		return false
+	end
+
 	-- The first UI label containing any of these keywords is the challenge
 	-- announcement - that's what we show in the GUI.
 	local function labelFor(keywords)
@@ -610,13 +656,13 @@ local function detectPhase(snapshot, texts)
 	if has("fuel") or has("generator") then
 		return "generator", labelFor({"fuel", "generator"})
 	end
-	if has("laser") then
+	if hazardMatch("laser", {"touch", "avoid", "don't", "dont", "survive", "beam"}) then
 		return "laser", labelFor({"laser"})
 	end
-	if has("lava") or has("drown") then
+	if hazardMatch("lava", {"drown", "don't", "dont", "avoid", "touch", "survive", "rising", "stay"}) then
 		return "lava", labelFor({"lava", "drown"})
 	end
-	if has("abyss") then
+	if hazardMatch("abyss", {"fall", "don't", "dont", "into", "avoid"}) then
 		return "abyss", labelFor({"abyss"})
 	end
 	if #snapshot.slabs > 0 and has("slab") then
@@ -649,7 +695,7 @@ local function detectPhase(snapshot, texts)
 	if #snapshot.chairs > 0 and (has("sit") or has("chair")) then
 		return "chair", labelFor({"sit", "chair"})
 	end
-	if has("tile") or (has("disappear") and has("fall")) then
+	if hazardMatch("tile", {"disappear", "fall", "don't", "dont"}) or (has("disappear") and has("fall")) then
 		return "tiles", labelFor({"tile", "disappear", "fall"})
 	end
 	if #snapshot.plates > 0 and (has("stand") or has("plate") or has("color")) then
@@ -668,18 +714,25 @@ end
 -- ---------- Fly pad (client-created anchored platform) ----------
 
 local flyPad = nil
+local flyAlt = nil -- hover altitude chosen once per fly phase
 
 local function clearFlyPad()
 	if flyPad ~= nil then
 		pcall(function() flyPad:Destroy() end)
 		flyPad = nil
 	end
+	flyAlt = nil
 end
 
 local function flyUp()
 	local root = getRootPart()
 	if root == nil then
 		return "no root"
+	end
+
+	local pos = root.Position
+	if flyAlt == nil then
+		flyAlt = pos.Y + 30 -- pick a fixed hover altitude once per phase
 	end
 
 	if flyPad == nil or flyPad.Parent == nil then
@@ -693,20 +746,21 @@ local function flyUp()
 			p.Parent = Workspace
 			return p
 		end)
-		if not ok then
-			-- fallback: just keep teleporting up
-		else
+		if ok then
 			flyPad = pad
 		end
 	end
 
-	local target = root.Position + Vector3.new(0, 30, 0)
+	local target = Vector3.new(pos.X, flyAlt, pos.Z)
 	if flyPad ~= nil then
 		flyPad.Position = Vector3.new(target.X, target.Y - 3, target.Z)
-		flyPad.CFrame = CFrame.new(flyPad.Position)
 	end
-	teleportTo(target)
-	return "flying above the hazard"
+	-- Only re-teleport once we drop below the hover altitude. This keeps us
+	-- hovering instead of stacking +30 studs every tick into the kill zone.
+	if pos.Y < flyAlt - 5 then
+		teleportTo(target)
+	end
+	return "hovering above the hazard"
 end
 
 -- ---------- Phase handlers ----------
@@ -1342,6 +1396,7 @@ local function createStatusPanel()
 	frameStroke.Parent = frame
 
 	local titleBar = Instance.new("TextLabel")
+	titleBar.Name = "TitleBar"
 	titleBar.Size = UDim2.new(1, 0, 0, 30)
 	titleBar.BackgroundColor3 = Color3.fromRGB(34, 37, 48)
 	titleBar.Text = "Last to Leave Box"
@@ -1426,35 +1481,9 @@ local function createStatusPanel()
 		screenGui:Destroy()
 	end
 
-	-- Drag by title bar.
-	local dragging = false
-	local dragStart = Vector2.zero
-	local frameStart = frame.Position
-
-	table.insert(panelConnections, titleBar.InputBegan:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = true
-			dragStart = input.Position
-			frameStart = frame.Position
-		end
-	end))
-
-	table.insert(panelConnections, UserInputService.InputChanged:Connect(function(input)
-		if not dragging then
-			return
-		end
-
-		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-			local delta = input.Position - dragStart
-			frame.Position = UDim2.fromOffset(frameStart.X.Offset + delta.X, frameStart.Y.Offset + delta.Y)
-		end
-	end))
-
-	table.insert(panelConnections, UserInputService.InputEnded:Connect(function(input)
-		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-			dragging = false
-		end
-	end))
+	-- The panel is fixed in place: it must stay visible until [Remove] is
+	-- pressed, so there is intentionally no drag-by-title behavior (on
+	-- touch devices a drag used to shove the panel off-screen).
 
 	scanButton.MouseButton1Click:Connect(function()
 		if boundAPI ~= nil and boundAPI.scan ~= nil then
