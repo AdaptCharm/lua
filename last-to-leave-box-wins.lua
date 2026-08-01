@@ -211,6 +211,53 @@ local function jsonEncode(v)
 	return '"' .. jsonEscape(tostring(v)) .. '"'
 end
 
+-- ---------- Challenge-text filter ----------
+-- The lobby/HUD shows a lot of persistent text that is never a challenge
+-- announcement: shop labels, role menus, money amounts, buttons. Calibrated
+-- from real game payloads. Texts matching these are dropped before phase
+-- detection so "Cash shop" can't trigger the cash challenge, etc.
+local HUD_NOISE = {
+	"cash shop", "robux shop", "shop", "swap", "unpair", "current role",
+	"role change request", "like reward", "like the game", "join the group",
+	"become", "choose next task", "buy", "magnet", "click button", "claim",
+	"reward", "host", "guard", "task", "role",
+}
+
+local function isHudNoise(text)
+	if text == nil then
+		return true
+	end
+	local tl = lower(text)
+	if tl == "" then
+		return true
+	end
+	if tl == "yes" or tl == "no" or tl == "x" or tl == "~" or tl == "..." or tl == "." then
+		return true
+	end
+	-- Pure numbers / money amounts: "50,000", "161K", "1.16M", "149", "437K"
+	local stripped = tl:gsub("[%d%,%.%s]", ""):gsub("[km]$", "")
+	if stripped == "" then
+		return true
+	end
+	for _, word in ipairs(HUD_NOISE) do
+		if string.find(tl, word, 1, true) ~= nil then
+			return true
+		end
+	end
+	return false
+end
+
+-- Keep only texts that could be a challenge announcement.
+local function filterChallengeTexts(texts)
+	local out = {}
+	for _, t in ipairs(texts) do
+		if not isHudNoise(t) then
+			out[#out + 1] = t
+		end
+	end
+	return out
+end
+
 -- ---------- Debug relay ----------
 
 local function posTable(v)
@@ -279,6 +326,12 @@ local function buildPayload(snapshot, texts, phase, message, reason)
 	for i = 1, n do
 		payload.ui[i] = string.sub(texts[i], 1, 200)
 	end
+	payload.candidates = {}
+	local cands = filterChallengeTexts(texts)
+	for i = 1, math.min(#cands, 12) do
+		payload.candidates[i] = string.sub(cands[i], 1, 200)
+	end
+	payload.workspaceChildren = snapshot.workspaceChildren or {}
 	payload.masks = catTable(snapshot.masks)
 	payload.chairs = catTable(snapshot.chairs)
 	payload.bombs = catTable(snapshot.bombs)
@@ -594,6 +647,20 @@ local function collectUIText()
 	return texts
 end
 
+-- Is this part inside a player/NPC character model? Their body parts look
+-- like generic pickups to name matching, so they are never challenge
+-- objects (this killed a "balls = other players' limbs" false positive).
+local function isPartOfCharacter(obj)
+	local p = obj
+	while p ~= nil do
+		if p:IsA("Model") and p:FindFirstChildOfClass("Humanoid") ~= nil then
+			return true
+		end
+		p = p.Parent
+	end
+	return false
+end
+
 local function scanWorkspace()
 	local snapshot = {
 		masks = {},
@@ -607,10 +674,17 @@ local function scanWorkspace()
 		balls = {},
 		potatoes = {},
 		generators = {},
+		workspaceChildren = {},
 	}
 
+	for _, child in ipairs(Workspace:GetChildren()) do
+		if #snapshot.workspaceChildren < 60 and child.Name ~= "L2LB_FlyPad" then
+			snapshot.workspaceChildren[#snapshot.workspaceChildren + 1] = child.Name
+		end
+	end
+
 	for _, obj in ipairs(Workspace:GetDescendants()) do
-		if obj:IsA("BasePart") then
+		if obj:IsA("BasePart") and not isPartOfCharacter(obj) then
 			local parentName = ""
 			if obj.Parent ~= nil then
 				parentName = obj.Parent.Name
@@ -668,6 +742,10 @@ local CHALLENGE_NAMES = {
 }
 
 local function detectPhase(snapshot, texts)
+	-- Drop lobby/HUD text (shop, roles, money) before any matching so the
+	-- persistent UI can never trigger a challenge on its own.
+	texts = filterChallengeTexts(texts)
+
 	local combined = lower(table.concat(texts, " "))
 
 	local function has(keyword)
