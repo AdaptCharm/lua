@@ -75,6 +75,7 @@ local DEFAULT_CONFIG = {
 local wallState = {
 	botOn = false,
 	message = "watching for a challenge.",
+	lastRawTexts = "",
 }
 
 -- Teardown hooks registered by subsystems (auto collector) so [Remove]
@@ -1271,6 +1272,7 @@ local function createBot(config)
 		end
 
 		print("=== Scan end ===")
+		wallState.lastRawTexts = table.concat(texts, " | ")
 		flashMessage("Scan sent - posting to the debug server...")
 		sendDebug(snapshot, texts, lastPhaseName, "", "scan")
 	end
@@ -1367,6 +1369,7 @@ local function createCollector(config)
 		local ok, err = pcall(function()
 			local snapshot = scanWorkspace()
 			local texts = collectUIText()
+			wallState.lastRawTexts = table.concat(texts, " | ")
 			local phase = detectPhase(snapshot, texts)
 			sendDebug(snapshot, texts, phase, "auto", "auto")
 		end)
@@ -1411,7 +1414,7 @@ local function createStatusPanel()
 	local frame = Instance.new("Frame")
 	frame.Name = "Panel"
 	frame.AnchorPoint = Vector2.new(1, 1)
-	frame.Size = UDim2.fromOffset(320, 170)
+	frame.Size = UDim2.fromOffset(320, 190)
 	frame.Position = UDim2.new(1, -12, 1, -12)
 	frame.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
 	frame.BorderSizePixel = 0
@@ -1501,6 +1504,21 @@ local function createStatusPanel()
 	removeCorner.CornerRadius = UDim.new(0, 6)
 	removeCorner.Parent = removeButton
 
+	-- Raw texts from the last scan/auto, so the user can screenshot and share.
+	local rawTextsLabel = Instance.new("TextLabel")
+	rawTextsLabel.Name = "RawTextsLabel"
+	rawTextsLabel.Size = UDim2.new(1, -20, 0, 46)
+	rawTextsLabel.Position = UDim2.fromOffset(10, 138)
+	rawTextsLabel.BackgroundTransparency = 1
+	rawTextsLabel.Text = ""
+	rawTextsLabel.TextColor3 = Color3.fromRGB(140, 150, 170)
+	rawTextsLabel.Font = Enum.Font.SourceSans
+	rawTextsLabel.TextSize = 11
+	rawTextsLabel.TextXAlignment = Enum.TextXAlignment.Left
+	rawTextsLabel.TextYAlignment = Enum.TextYAlignment.Top
+	rawTextsLabel.TextWrapped = true
+	rawTextsLabel.Parent = frame
+
 	local panelConnections = {}
 	local lastRefresh = 0
 
@@ -1551,6 +1569,9 @@ local function createStatusPanel()
 		end
 
 		statusLabel.Text = wallState.message
+		if rawTextsLabel.Text ~= wallState.lastRawTexts then
+			rawTextsLabel.Text = wallState.lastRawTexts
+		end
 	end))
 
 	return {
