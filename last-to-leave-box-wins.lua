@@ -1,7 +1,4 @@
--- If you see this line in your executor console, execution works and the
--- problem is further down. If you do NOT see it, the script never ran
--- (bad load URL, or the executor could not parse the script).
-print("[LastToLeaveBox] loaded (compatibility build)")
+print("[LastToLeaveBox] loaded (challenge bot)")
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -11,48 +8,31 @@ local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 if LocalPlayer == nil then
-	-- Executors sometimes inject before the player has loaded.
 	wait(1)
 	LocalPlayer = Players.LocalPlayer
 end
 
 if LocalPlayer == nil then
-	warn("[LastToLeaveBox] Could not find LocalPlayer - re-execute the script.")
+	warn("[LastToLeaveBox] Could not find LocalPlayer.")
 	return
 end
 
--- Most executors expose getgenv(); a few do not. Fall back to the
--- global table so the script still runs either way.
 local function getEnvironment()
-	local getgenvFn = _G.getgenv
-	if getgenvFn ~= nil then
-		return getgenvFn()
+	local fn = _G.getgenv
+	if fn ~= nil then
+		return fn()
 	end
-
 	return _G
 end
 
 local DEFAULT_CONFIG = {
 	enabled = true,
-	autoClearCacheOnDisable = false,
-	radius = 40,
-	height = 100,
-	rotationSpeed = 10,
-	attractionStrength = 1000,
-	maxPartsPerFrame = 10000,
 }
 
-local SEGMENT_LENGTH = 5
-local WALL_THICKNESS = 2
-local WALL_COLOR = Color3.fromRGB(255, 90, 90)
-local TOGGLE_KEY = Enum.KeyCode.RightShift
-local WALL_MODEL_NAME = "LastToLeaveBoxWall"
-local VELOCITY_NAME = "WallPull"
-
--- Shared state between the wall and the status panel.
+-- Shared state for the panel.
 local wallState = {
-	active = false,
-	partCount = 0,
+	botOn = false,
+	message = "",
 }
 
 local statusPanelAPI = nil
@@ -66,11 +46,12 @@ local function reportStatus(text)
 	warn("[LastToLeaveBox]", text)
 end
 
+-- ---------- Config ----------
+
 local function resolveNumber(value, fallback)
 	if type(value) ~= "number" then
 		return fallback
 	end
-
 	return value
 end
 
@@ -78,327 +59,468 @@ local function resolveBoolean(value, fallback)
 	if type(value) ~= "boolean" then
 		return fallback
 	end
-
 	return value
 end
 
--- The user config is read once, at load, and every field falls back to
--- its default independently, so a partial config table is fine.
 local function resolveConfig()
 	local userConfig = getEnvironment().config
-
 	return {
 		enabled = resolveBoolean(userConfig and userConfig.enabled, DEFAULT_CONFIG.enabled),
-		autoClearCacheOnDisable = resolveBoolean(userConfig and userConfig.autoClearCacheOnDisable, DEFAULT_CONFIG.autoClearCacheOnDisable),
-		radius = math.max(resolveNumber(userConfig and userConfig.radius, DEFAULT_CONFIG.radius), 1),
-		height = math.max(resolveNumber(userConfig and userConfig.height, DEFAULT_CONFIG.height), 1),
-		rotationSpeed = resolveNumber(userConfig and userConfig.rotationSpeed, DEFAULT_CONFIG.rotationSpeed),
-		attractionStrength = math.max(resolveNumber(userConfig and userConfig.attractionStrength, DEFAULT_CONFIG.attractionStrength), 0),
-		maxPartsPerFrame = math.max(resolveNumber(userConfig and userConfig.maxPartsPerFrame, DEFAULT_CONFIG.maxPartsPerFrame), 1),
 	}
 end
 
-local function findRootPart(character)
-	local rootPart = character:FindFirstChild("HumanoidRootPart")
-	if rootPart ~= nil and rootPart:IsA("BasePart") then
-		return rootPart
-	end
+-- ---------- Utilities ----------
 
-	return nil
-end
-
-local function currentCenter()
+local function getRootPart()
 	local character = LocalPlayer.Character
 	if character == nil then
-		return Vector3.zero
+		return nil
 	end
 
-	local rootPart = findRootPart(character)
-	if rootPart == nil then
-		return Vector3.zero
-	end
-
-	return Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z)
-end
-
-local function ringPartCount(radius)
-	return math.max(1, math.ceil((math.pi * 2 * radius) / SEGMENT_LENGTH))
-end
-
--- Builds one wall segment around the origin. The wall is positioned and
--- rotated as a whole later, so segments only need their local CFrame.
-local function buildRingPart(radius, height, index, total)
-	local angle = (index / total) * (math.pi * 2)
-	local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
-	local position = offset + Vector3.new(0, height / 2, 0)
-
-	local part = Instance.new("Part")
-	part.Name = "RingSegment"
-	part.Size = Vector3.new(SEGMENT_LENGTH, height, WALL_THICKNESS)
-	part.CFrame = CFrame.lookAt(position, position + offset.Unit)
-	part.Anchored = true
-	part.CanCollide = true
-	part.CanTouch = false
-	part.CanQuery = false
-	part.Material = Enum.Material.Neon
-	part.Color = WALL_COLOR
-
-	return part
-end
-
-local function newPrimaryPart()
-	local primaryPart = Instance.new("Part")
-	primaryPart.Anchored = true
-	primaryPart.Transparency = 1
-	primaryPart.CanCollide = false
-	primaryPart.CanTouch = false
-	primaryPart.CanQuery = false
-	primaryPart.Size = Vector3.new(1, 1, 1)
-
-	return primaryPart
-end
-
--- The wall model is looked up by name instead of holding a reference.
--- If the server rejects a client-created model, it is destroyed, and a
--- stale reference would throw on every frame. A fresh lookup simply
--- returns nil and we treat that as "the wall is gone".
-local function findWallModel()
-	local model = Workspace:FindFirstChild(WALL_MODEL_NAME)
-	if model ~= nil and model:IsA("Model") then
-		return model
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if root ~= nil and root:IsA("BasePart") then
+		return root
 	end
 
 	return nil
 end
 
-local function createWall(config)
+local function getHumanoid()
+	local character = LocalPlayer.Character
+	if character == nil then
+		return nil
+	end
+
+	return character:FindFirstChildOfClass("Humanoid")
+end
+
+local function teleportTo(position)
+	local root = getRootPart()
+	if root == nil then
+		return false
+	end
+
+	if (root.Position - position).Magnitude < 4 then
+		return true
+	end
+
+	root.CFrame = CFrame.new(position)
+	return true
+end
+
+local function lower(text)
+	return string.lower(text or "")
+end
+
+-- ---------- Color helpers ----------
+
+local COLOR_MAP = {
+	{ "red", Color3.fromRGB(255, 0, 0) },
+	{ "blue", Color3.fromRGB(0, 0, 255) },
+	{ "green", Color3.fromRGB(0, 255, 0) },
+	{ "yellow", Color3.fromRGB(255, 255, 0) },
+	{ "orange", Color3.fromRGB(255, 165, 0) },
+	{ "purple", Color3.fromRGB(128, 0, 255) },
+	{ "pink", Color3.fromRGB(255, 105, 180) },
+	{ "white", Color3.fromRGB(255, 255, 255) },
+	{ "black", Color3.fromRGB(0, 0, 0) },
+	{ "cyan", Color3.fromRGB(0, 255, 255) },
+	{ "magenta", Color3.fromRGB(255, 0, 255) },
+	{ "brown", Color3.fromRGB(165, 42, 42) },
+	{ "lime", Color3.fromRGB(50, 255, 50) },
+}
+
+local function findColorInText(text)
+	local t = lower(text)
+	for _, entry in ipairs(COLOR_MAP) do
+		if string.find(t, entry[1], 1, true) ~= nil then
+			return entry
+		end
+	end
+	return nil
+end
+
+local function closestPlate(plates, targetColor)
+	local best = nil
+	local bestDist = math.huge
+
+	for _, part in ipairs(plates) do
+		local c = part.Color
+		local d = math.abs(c.R - targetColor.R) + math.abs(c.G - targetColor.G) + math.abs(c.B - targetColor.B)
+		if d < bestDist then
+			best = part
+			bestDist = d
+		end
+	end
+
+	if best ~= nil and bestDist < 0.5 then
+		return best
+	end
+
+	return nil
+end
+
+-- ---------- Object scanning ----------
+
+local function isMatch(name, keywords)
+	local n = lower(name)
+	for _, kw in ipairs(keywords) do
+		if string.find(n, kw, 1, true) ~= nil then
+			return true
+		end
+	end
+	return false
+end
+
+local function collectUIText()
+	local texts = {}
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if playerGui == nil then
+		return texts
+	end
+
+	local function walk(inst)
+		-- Never read text from our own panel - the status line contains phase
+		-- keywords ("walking onto the gas mask", ...) that would otherwise
+		-- keep the bot stuck in the wrong phase forever.
+		if inst.Name == "LastToLeaveBoxPanel" then
+			return
+		end
+
+		if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
+			local t = inst.Text
+			if t ~= nil and t ~= "" then
+				table.insert(texts, t)
+			end
+		end
+
+		for _, child in ipairs(inst:GetChildren()) do
+			walk(child)
+		end
+	end
+
+	walk(playerGui)
+	return texts
+end
+
+local function scanWorkspace()
+	local snapshot = {
+		masks = {},
+		chairs = {},
+		bombs = {},
+		plates = {},
+		floors = {},
+	}
+
+	for _, obj in ipairs(Workspace:GetDescendants()) do
+		if obj:IsA("BasePart") then
+			local parentName = ""
+			if obj.Parent ~= nil then
+				parentName = obj.Parent.Name
+			end
+
+			if isMatch(obj.Name, {"mask", "gas"}) or isMatch(parentName, {"mask", "gas"}) then
+				table.insert(snapshot.masks, obj)
+			elseif obj:IsA("Seat") or obj:IsA("VehicleSeat") or isMatch(obj.Name, {"chair", "seat"}) or isMatch(parentName, {"chair", "seat"}) then
+				table.insert(snapshot.chairs, obj)
+			elseif isMatch(obj.Name, {"bomb", "defuse"}) or isMatch(parentName, {"bomb", "defuse"}) then
+				table.insert(snapshot.bombs, obj)
+			elseif isMatch(obj.Name, {"plate", "pad", "panel", "tile"}) or isMatch(parentName, {"plate", "pad", "panel", "tile"}) then
+				table.insert(snapshot.plates, obj)
+			elseif isMatch(obj.Name, {"floor", "platform", "ground"}) or isMatch(parentName, {"floor", "platform", "ground"}) then
+				table.insert(snapshot.floors, obj)
+			end
+		end
+	end
+
+	return snapshot
+end
+
+-- ---------- Phase detection ----------
+
+local function detectPhase(snapshot, combined)
+	local function has(keyword)
+		return string.find(combined, keyword, 1, true) ~= nil
+	end
+
+	if #snapshot.masks > 0 and (has("gas mask") or has("pick up") or has("mask")) then
+		return "mask"
+	end
+
+	if #snapshot.chairs > 0 and (has("sit") or has("chair")) then
+		return "chair"
+	end
+
+	if #snapshot.bombs > 0 and (has("bomb") or has("defuse")) then
+		return "bomb"
+	end
+
+	if #snapshot.plates > 0 and (has("stand") or has("plate") or has("color")) then
+		local entry = findColorInText(combined)
+		if entry ~= nil then
+			return "plate"
+		end
+	end
+
+	if #snapshot.floors > 0 and (has("don't fall") or has("dont fall") or has("fall") or has("floor")) then
+		return "floor"
+	end
+
+	return "unknown"
+end
+
+-- ---------- Phase handlers ----------
+
+local function handleMask(snapshot)
+	local mask = snapshot.masks[1]
+	if mask == nil then
+		return "no mask found"
+	end
+
+	teleportTo(mask.Position + Vector3.new(0, 3, 0))
+	return "walking onto the gas mask"
+end
+
+local function handleChair(snapshot)
+	local chair = snapshot.chairs[1]
+	if chair == nil then
+		return "no chair found"
+	end
+
+	teleportTo(chair.Position + Vector3.new(0, 3, 0))
+
+	local humanoid = getHumanoid()
+	if humanoid ~= nil then
+		humanoid.Sit = true
+	end
+
+	return "sitting on a chair"
+end
+
+local function floorTop(part)
+	return part.Position + Vector3.new(0, part.Size.Y / 2 + 2, 0)
+end
+
+local function findHighestFloorTop(floors)
+	local best = nil
+	local bestY = -math.huge
+	for _, part in ipairs(floors) do
+		local top = floorTop(part)
+		if top.Y > bestY then
+			best = top
+			bestY = top.Y
+		end
+	end
+	return best
+end
+
+local function handleFloor(snapshot)
+	local anchoredAny = false
+	for _, part in ipairs(snapshot.floors) do
+		if not part.Anchored then
+			part.Anchored = true
+			anchoredAny = true
+		end
+	end
+
+	local root = getRootPart()
+	if root ~= nil and root.Position.Y < 5 then
+		local safe = findHighestFloorTop(snapshot.floors)
+		if safe ~= nil then
+			teleportTo(safe)
+			return "rescued from the fall"
+		end
+	end
+
+	if anchoredAny then
+		return "floor anchored"
+	end
+
+	return "floor watching"
+end
+
+local function handleBomb(snapshot)
+	local bomb = snapshot.bombs[1]
+	if bomb == nil then
+		return "no bomb found"
+	end
+
+	teleportTo(bomb.Position + Vector3.new(0, 2, 0))
+	return "standing on the bomb, holding"
+end
+
+local function handlePlate(snapshot, combined)
+	local entry = findColorInText(combined)
+	if entry == nil then
+		return "color not announced"
+	end
+
+	local plate = closestPlate(snapshot.plates, entry[2])
+	if plate == nil then
+		return "no plate matches " .. entry[1]
+	end
+
+	teleportTo(plate.Position + Vector3.new(0, 3, 0))
+	return "standing on the " .. entry[1] .. " plate"
+end
+
+-- ---------- Bot creation ----------
+
+local function createBot(config)
 	local connections = {}
+	local botConnection = nil
 
-	local buildConnection = nil
-	local rotationConnection = nil
+	local botOn = config.enabled
+	local holdingDefuse = false
+	local lastMessage = ""
+	local lastTick = 0
 
-	local active = false
-	local destroyed = false
-	local angle = 0
-	local forceRejectCount = 0
-	local reportedForceRejection = false
-
-	local function setWallState(nowActive, partCount)
-		wallState.active = nowActive
-		wallState.partCount = partCount
+	local function setBotState(on)
+		botOn = on
+		wallState.botOn = on
 	end
 
-	local function handleWallRemoved()
-		if not active then
-			return
-		end
-
-		active = false
-		setWallState(false, 0)
-
-		if rotationConnection ~= nil then
-			rotationConnection:Disconnect()
-			rotationConnection = nil
-		end
-
-		if buildConnection ~= nil then
-			buildConnection:Disconnect()
-			buildConnection = nil
-		end
-
-		reportStatus("The wall was removed by the game - this server rejects client-created parts.")
-	end
-
-	local function applyAttractionTo(player, center, pullRange)
-		if player == LocalPlayer then
-			return
-		end
-
-		local character = player.Character
-		if character == nil then
-			return
-		end
-
-		local rootPart = findRootPart(character)
-		if rootPart == nil then
-			return
-		end
-
-		local offset = rootPart.Position - center
-		local distance = offset.Magnitude
-		if distance < 1 or distance > pullRange then
-			local velocity = rootPart:FindFirstChild(VELOCITY_NAME)
-			if velocity ~= nil then
-				velocity:Destroy()
+	local function botTick()
+		if not botOn then
+			if holdingDefuse then
+				VirtualUser:Button1Up()
+				holdingDefuse = false
 			end
-
 			return
 		end
 
-		-- The force is also looked up fresh: if the server keeps
-		-- destroying it, we stop creating it and say so.
-		local velocity = rootPart:FindFirstChild(VELOCITY_NAME)
-		if velocity == nil then
-			forceRejectCount = forceRejectCount + 1
+		-- throttle: 0.25s between ticks
+		local now = os.clock()
+		if now - lastTick < 0.25 then
+			return
+		end
+		lastTick = now
 
-			if forceRejectCount > 10 then
-				if not reportedForceRejection then
-					reportedForceRejection = true
-					reportStatus("The pull force keeps getting rejected - the wall is not affecting other players.")
-				end
+		local snapshot = scanWorkspace()
+		local texts = collectUIText()
+		local combined = lower(table.concat(texts, " "))
+		local phase = detectPhase(snapshot, combined)
+		local message = ""
 
-				return
+		if phase == "mask" then
+			message = handleMask(snapshot)
+		elseif phase == "chair" then
+			message = handleChair(snapshot)
+		elseif phase == "bomb" then
+			if not holdingDefuse then
+				VirtualUser:Button1Down()
+				holdingDefuse = true
 			end
-
-			velocity = Instance.new("BodyVelocity")
-			velocity.Name = VELOCITY_NAME
-			velocity.MaxForce = Vector3.new(config.attractionStrength, 0, config.attractionStrength)
-			velocity.Parent = rootPart
+			message = handleBomb(snapshot)
+		elseif phase == "plate" then
+			message = handlePlate(snapshot, combined)
+		elseif phase == "floor" then
+			message = handleFloor(snapshot)
 		else
-			forceRejectCount = 0
+			message = "watching for a challenge..."
+			if holdingDefuse then
+				VirtualUser:Button1Up()
+				holdingDefuse = false
+			end
 		end
 
-		-- Aim at the nearest point on the ring so they slam into the wall.
-		local ringPoint = center + (offset / distance) * config.radius
-		local pullDirection = (ringPoint - rootPart.Position).Unit
-		velocity.Velocity = pullDirection * (config.attractionStrength / 10)
-	end
-
-	local function applyAttraction()
-		if config.attractionStrength <= 0 then
-			return
-		end
-
-		local center = currentCenter()
-		local pullRange = config.radius * 2
-
-		for _, player in pairs(Players:GetPlayers()) do
-			applyAttractionTo(player, center, pullRange)
+		if message ~= lastMessage then
+			lastMessage = message
+			wallState.message = message
+			reportStatus("Bot: " .. phase .. " - " .. message)
 		end
 	end
 
-	local function rotateAndAttract(dt)
-		local model = findWallModel()
-		if model == nil then
-			handleWallRemoved()
+	-- ---------- API methods ----------
+
+	local function enable()
+		if botOn then
 			return
 		end
-
-		angle = angle + math.rad(config.rotationSpeed) * dt
-		model:PivotTo(CFrame.new(currentCenter()) * CFrame.Angles(0, angle, 0))
-		applyAttraction()
+		setBotState(true)
+		reportStatus("Bot enabled")
 	end
 
-	local function start()
-		if destroyed or active or buildConnection ~= nil then
+	local function disable()
+		if not botOn then
 			return
 		end
-
-		angle = 0
-		forceRejectCount = 0
-		reportedForceRejection = false
-
-		local previous = findWallModel()
-		if previous ~= nil then
-			previous:Destroy()
+		setBotState(false)
+		if holdingDefuse then
+			VirtualUser:Button1Up()
+			holdingDefuse = false
 		end
-
-		local model = Instance.new("Model")
-		model.Name = WALL_MODEL_NAME
-
-		local primaryPart = newPrimaryPart()
-		primaryPart.Parent = model
-		model.PrimaryPart = primaryPart
-		model.Parent = Workspace
-
-		local totalParts = ringPartCount(config.radius)
-		local created = 0
-
-		-- Declared before the closure so the callback can disconnect
-		-- itself (a `local x = Connect(function() x end)` closure would
-		-- capture the global x, which is nil).
-		local build = nil
-		build = RunService.Heartbeat:Connect(function()
-			-- A rejected model disappears from Workspace; checking by name
-			-- avoids touching a destroyed instance.
-			if Workspace:FindFirstChild(WALL_MODEL_NAME) ~= model then
-				build:Disconnect()
-				buildConnection = nil
-				reportStatus("The wall was rejected while building - this server filters client-created parts.")
-				return
-			end
-
-			local batchEnd = math.min(created + config.maxPartsPerFrame, totalParts)
-
-			while created < batchEnd do
-				local part = buildRingPart(config.radius, config.height, created, totalParts)
-				part.Parent = model
-				created = created + 1
-			end
-
-			if created >= totalParts then
-				build:Disconnect()
-				buildConnection = nil
-
-				model:PivotTo(CFrame.new(currentCenter()))
-				rotationConnection = RunService.Heartbeat:Connect(rotateAndAttract)
-				active = true
-				setWallState(true, created)
-				reportStatus(string.format("Wall active (%d parts). RightShift toggles.", created))
-
-				-- Some servers delete the wall a moment after we build it;
-				-- verify it survived so we can report that instead of
-				-- silently spinning a dead wall.
-				delay(2, function()
-					if active and findWallModel() == nil then
-						handleWallRemoved()
-					end
-				end)
-			end
-		end)
-		buildConnection = build
+		reportStatus("Bot disabled")
 	end
 
-	local function stop()
-		if destroyed then
-			return
+	local function toggle()
+		if botOn then
+			disable()
+		else
+			enable()
 		end
+	end
 
-		if buildConnection ~= nil then
-			buildConnection:Disconnect()
-			buildConnection = nil
-		end
+	local function dumpGame()
+		print("=== LastToLeaveBox scan ===")
+		print("PlaceId:", game.PlaceId)
 
-		if rotationConnection ~= nil then
-			rotationConnection:Disconnect()
-			rotationConnection = nil
-		end
+		local ok, gname = pcall(function() return game.Name end)
+		print("Name:", tostring(gname))
 
-		active = false
-		setWallState(false, 0)
+		local snapshot = scanWorkspace()
+		local texts = collectUIText()
+		print("Objects found:")
+		print("masks:", #snapshot.masks, "chairs:", #snapshot.chairs, "bombs:", #snapshot.bombs, "plates:", #snapshot.plates, "floors:", #snapshot.floors)
 
-		if config.autoClearCacheOnDisable then
-			local model = findWallModel()
-			if model ~= nil then
-				model:Destroy()
+		local function dumpList(kind, list)
+			for _, part in ipairs(list) do
+				local extra = ""
+				if part:IsA("BasePart") and part.Color ~= nil then
+					extra = string.format(" color=(%.3f,%.3f,%.3f)", part.Color.R, part.Color.G, part.Color.B)
+				end
+				print("  " .. kind .. ":", part.Name, part.ClassName, extra)
 			end
 		end
+		dumpList("mask", snapshot.masks)
+		dumpList("chair", snapshot.chairs)
+		dumpList("bomb", snapshot.bombs)
+		dumpList("plate", snapshot.plates)
+		dumpList("floor", snapshot.floors)
+
+		print("UI texts (" .. #texts .. "):")
+		for _, t in ipairs(texts) do
+			print("  ", t)
+		end
+
+		-- CFrame teleport probe
+		local root = getRootPart()
+		if root ~= nil then
+			local before = root.Position
+			root.CFrame = root.CFrame * CFrame.new(1, 0, 0)
+			local probeBefore = root.Position
+			delay(0.4, function()
+				local probeAfter = root.Position
+				local dist = (before - probeAfter).Magnitude
+				print("Teleport probe: moved", string.format("%.2f", dist), "studs (works if > 0.5)")
+				-- restore position
+				root.CFrame = CFrame.new(before)
+			end)
+		end
+
+		print("=== Scan end ===")
+		reportStatus("Scan complete - see executor console")
 	end
 
 	local function teardown()
-		if destroyed then
-			return
+		if botConnection ~= nil then
+			botConnection:Disconnect()
+			botConnection = nil
 		end
 
-		stop()
-		destroyed = true
+		disable()
 
-		local model = findWallModel()
-		if model ~= nil then
-			model:Destroy()
-		end
-
-		for _, connection in pairs(connections) do
+		for _, connection in ipairs(connections) do
 			connection:Disconnect()
 		end
 
@@ -407,55 +529,51 @@ local function createWall(config)
 		end
 	end
 
-	local function toggle()
-		if active then
-			stop()
-		else
-			start()
-		end
-	end
+	-- Bot tick on Heartbeat.
+	botConnection = RunService.Heartbeat:Connect(botTick)
 
-	-- The character is never blocked by its own wall.
+	-- Anti-idle so the player doesn't get kicked while the bot works.
+	table.insert(connections, LocalPlayer.Idled:Connect(function()
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.zero)
+	end))
+
+	-- Toggle key.
+	table.insert(connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
+		if gameProcessed then
+			return
+		end
+
+		if input.KeyCode == Enum.KeyCode.RightShift then
+			toggle()
+		end
+	end))
+
+	-- Character no-collide: let us walk through parts the bot teleports us to.
 	table.insert(connections, RunService.Stepped:Connect(function()
 		local character = LocalPlayer.Character
 		if character == nil then
 			return
 		end
 
-		for _, part in pairs(character:GetDescendants()) do
+		for _, part in ipairs(character:GetDescendants()) do
 			if part:IsA("BasePart") then
 				part.CanCollide = false
 			end
 		end
 	end))
 
-	-- Roblox kicks idle players, so nudge the input system to stay put.
-	table.insert(connections, LocalPlayer.Idled:Connect(function()
-		VirtualUser:CaptureController()
-		VirtualUser:ClickButton2(Vector2.zero)
-	end))
-
-	table.insert(connections, UserInputService.InputBegan:Connect(function(input, gameProcessed)
-		if gameProcessed then
-			return
-		end
-
-		if input.KeyCode == TOGGLE_KEY then
-			toggle()
-		end
-	end))
-
 	return {
-		enable = start,
-		disable = stop,
+		enable = enable,
+		disable = disable,
 		toggle = toggle,
 		destroy = teardown,
+		scan = dumpGame,
 	}
 end
 
--- A small status panel in the corner of the screen. It is deliberately
--- minimal: its job is to show what the script is doing and why it might
--- not be working, not to clone a full script hub.
+-- ---------- Status panel ----------
+
 local function createStatusPanel()
 	local playerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
 	if playerGui == nil then
@@ -475,7 +593,7 @@ local function createStatusPanel()
 	local frame = Instance.new("Frame")
 	frame.Name = "Panel"
 	frame.AnchorPoint = Vector2.new(1, 1)
-	frame.Size = UDim2.fromOffset(280, 150)
+	frame.Size = UDim2.fromOffset(320, 170)
 	frame.Position = UDim2.new(1, -12, 1, -12)
 	frame.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
 	frame.BorderSizePixel = 0
@@ -512,24 +630,42 @@ local function createStatusPanel()
 	statusLabel.TextWrapped = true
 	statusLabel.Parent = frame
 
-	local toggleButton = Instance.new("TextButton")
-	toggleButton.Size = UDim2.fromOffset(120, 30)
-	toggleButton.Position = UDim2.fromOffset(10, 104)
-	toggleButton.BackgroundColor3 = Color3.fromRGB(45, 120, 255)
-	toggleButton.Text = "Enable"
-	toggleButton.TextColor3 = Color3.new(1, 1, 1)
-	toggleButton.Font = Enum.Font.SourceSansBold
-	toggleButton.TextSize = 14
-	toggleButton.BorderSizePixel = 0
-	toggleButton.Parent = frame
+	local BUTTON_Y = 104
+	local BUTTON_H = 30
 
-	local toggleCorner = Instance.new("UICorner")
-	toggleCorner.CornerRadius = UDim.new(0, 6)
-	toggleCorner.Parent = toggleButton
+	local scanButton = Instance.new("TextButton")
+	scanButton.Size = UDim2.fromOffset(80, BUTTON_H)
+	scanButton.Position = UDim2.fromOffset(10, BUTTON_Y)
+	scanButton.BackgroundColor3 = Color3.fromRGB(60, 140, 160)
+	scanButton.Text = "Scan"
+	scanButton.TextColor3 = Color3.new(1, 1, 1)
+	scanButton.Font = Enum.Font.SourceSansBold
+	scanButton.TextSize = 14
+	scanButton.BorderSizePixel = 0
+	scanButton.Parent = frame
+
+	local scanCorner = Instance.new("UICorner")
+	scanCorner.CornerRadius = UDim.new(0, 6)
+	scanCorner.Parent = scanButton
+
+	local botButton = Instance.new("TextButton")
+	botButton.Size = UDim2.fromOffset(100, BUTTON_H)
+	botButton.Position = UDim2.fromOffset(100, BUTTON_Y)
+	botButton.BackgroundColor3 = Color3.fromRGB(45, 120, 255)
+	botButton.Text = "Bot: ON"
+	botButton.TextColor3 = Color3.new(1, 1, 1)
+	botButton.Font = Enum.Font.SourceSansBold
+	botButton.TextSize = 14
+	botButton.BorderSizePixel = 0
+	botButton.Parent = frame
+
+	local botCorner = Instance.new("UICorner")
+	botCorner.CornerRadius = UDim.new(0, 6)
+	botCorner.Parent = botButton
 
 	local removeButton = Instance.new("TextButton")
-	removeButton.Size = UDim2.fromOffset(120, 30)
-	removeButton.Position = UDim2.fromOffset(150, 104)
+	removeButton.Size = UDim2.fromOffset(100, BUTTON_H)
+	removeButton.Position = UDim2.fromOffset(210, BUTTON_Y)
 	removeButton.BackgroundColor3 = Color3.fromRGB(190, 60, 60)
 	removeButton.Text = "Remove"
 	removeButton.TextColor3 = Color3.new(1, 1, 1)
@@ -552,14 +688,14 @@ local function createStatusPanel()
 	end
 
 	local function destroy()
-		for _, connection in pairs(panelConnections) do
+		for _, connection in ipairs(panelConnections) do
 			connection:Disconnect()
 		end
 
 		screenGui:Destroy()
 	end
 
-	-- Drag the panel by its title bar.
+	-- Drag by title bar.
 	local dragging = false
 	local dragStart = Vector2.zero
 	local frameStart = frame.Position
@@ -589,7 +725,13 @@ local function createStatusPanel()
 		end
 	end))
 
-	toggleButton.MouseButton1Click:Connect(function()
+	scanButton.MouseButton1Click:Connect(function()
+		if boundAPI ~= nil and boundAPI.scan ~= nil then
+			boundAPI.scan()
+		end
+	end)
+
+	botButton.MouseButton1Click:Connect(function()
 		if boundAPI ~= nil then
 			boundAPI.toggle()
 		end
@@ -601,7 +743,7 @@ local function createStatusPanel()
 		end
 	end)
 
-	-- Refresh the state line a few times per second.
+	-- Refresh the state line and button text.
 	table.insert(panelConnections, RunService.Heartbeat:Connect(function()
 		local now = os.clock()
 		if now - lastRefresh < 0.25 then
@@ -609,19 +751,17 @@ local function createStatusPanel()
 		end
 		lastRefresh = now
 
-		local stateText
-		if wallState.active then
-			stateText = string.format("Active - %d parts", wallState.partCount)
+		if wallState.botOn then
+			botButton.Text = "Bot: ON"
+			botButton.BackgroundColor3 = Color3.fromRGB(45, 120, 255)
 		else
-			stateText = "Disabled"
+			botButton.Text = "Bot: OFF"
+			botButton.BackgroundColor3 = Color3.fromRGB(100, 110, 120)
 		end
 
-		statusLabel.Text = stateText .. "\n" .. lastMessage
-
-		if wallState.active then
-			toggleButton.Text = "Disable"
-		else
-			toggleButton.Text = "Enable"
+		local msg = wallState.message
+		if msg ~= "" then
+			statusLabel.Text = msg
 		end
 	end))
 
@@ -631,22 +771,15 @@ local function createStatusPanel()
 	}
 end
 
+-- ---------- Main ----------
+
 print("[LastToLeaveBox] starting up...")
 
--- Re-running the script replaces the previous instance instead of
--- stacking a second one on top.
 local previousAPI = getEnvironment().lastToLeaveBox
 if previousAPI ~= nil then
 	local ok, err = pcall(previousAPI.destroy)
 	if not ok then
-		warn("[LastToLeaveBox] Failed to clean up the previous instance:", err)
-	end
-end
-
--- Clean up walls left behind by older versions that had no API.
-for _, model in pairs(Workspace:GetChildren()) do
-	if model:IsA("Model") and model.Name == WALL_MODEL_NAME then
-		model:Destroy()
+		warn("[LastToLeaveBox] Failed to clean up:", err)
 	end
 end
 
@@ -656,26 +789,29 @@ local statusPanel = createStatusPanel()
 if statusPanel ~= nil then
 	statusPanelAPI = statusPanel
 else
-	warn("[LastToLeaveBox] PlayerGui was not available - running without the status panel.")
+	warn("[LastToLeaveBox] No PlayerGui - panel skipped.")
 end
 
-local wallAPI = createWall(config)
-boundAPI = wallAPI
+local api = createBot(config)
+boundAPI = api
 
 local ok, regErr = pcall(function()
-	getEnvironment().lastToLeaveBox = wallAPI
+	getEnvironment().lastToLeaveBox = api
 end)
 if not ok then
-	warn("[LastToLeaveBox] Could not register the API (read-only getgenv?):", regErr)
+	warn("[LastToLeaveBox] API registration failed:", regErr)
 end
 
-reportStatus(string.format("Loaded on place %d - config.enabled = %s", game.PlaceId, tostring(config.enabled)))
+local stateText = "OFF"
+if config.enabled then
+	stateText = "ON"
+end
+
+reportStatus("Loaded on place " .. tostring(game.PlaceId) .. " - bot " .. stateText .. ". Press Scan to inspect the game.")
 
 if config.enabled then
-	local ok, err = pcall(wallAPI.enable)
+	local ok, err = pcall(api.enable)
 	if not ok then
-		reportStatus("Failed to start the wall: " .. tostring(err))
+		reportStatus("Failed to start bot: " .. tostring(err))
 	end
-else
-	reportStatus("Disabled by config - press RightShift or the Enable button to start.")
 end
