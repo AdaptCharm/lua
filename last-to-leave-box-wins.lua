@@ -27,10 +27,11 @@
 		chair   - sit on a chair; once seated, stop moving (no loop)
 		floor   - fly high (falling-floor challenge)
 
-	Debug relay: presses Scan (and phase changes / every 10s) POST a JSON
-	snapshot to https://ghost-vast-stag.ngrok-free.app/api/debug
-	(config.debugUrl, set to false to disable). The ngrok tunnel forwards
-	to the local debug_server.py on port 8123.
+	Debug relay: auto-posts a JSON snapshot every ~4s (config.debugUrl,
+	set to false to disable), plus on Scan and on every phase change, to
+	https://ghost-vast-stag.ngrok-free.app/api/debug - the ngrok tunnel
+	forwards to the local debug_server.py on port 8123. Successful POSTs
+	are confirmed ("posted" marker); failures show up on the status line.
 
 	Buttons: [Scan] dumps game state + posts to the debug server, [Bot]
 	toggles, [Remove] tears down. RightShift toggles the bot.
@@ -74,11 +75,22 @@ local wallState = {
 	message = "watching for a challenge.",
 }
 
+-- Teardown hooks registered by subsystems (auto collector) so [Remove]
+-- stops everything, not just the bot.
+local extraCleanup = {}
+
 local statusPanelAPI = nil
 local boundAPI = nil
 
 local function reportStatus(text)
 	warn("[LastToLeaveBox]", text)
+end
+
+-- Show a transient status message (scan confirmation / debug errors) for a
+-- few seconds; botTick defers its own message while the flash is active.
+local function flashMessage(text)
+	wallState.message = text
+	wallState.scanFlashUntil = os.clock() + 3
 end
 
 -- ---------- Config ----------
@@ -278,6 +290,62 @@ local function buildPayload(snapshot, texts, phase, message, reason)
 	return payload
 end
 
+-- A POST only counts if the server echoes the "posted" marker (a GET or a
+-- wrong-signature call returns something else, so we try the next strategy).
+local function responseConfirmed(resp)
+	if type(resp) == "table" then
+		if resp.Body ~= nil and type(resp.Body) == "string" then
+			return string.find(resp.Body, "posted", 1, true) ~= nil
+		end
+		return false
+	end
+	if type(resp) == "string" then
+		return string.find(resp, "posted", 1, true) ~= nil
+	end
+	return false
+end
+
+-- Executors vary in which HTTP calls they hook, so try every known form.
+local function tryHttpPost(url, body)
+	local strategies = {
+		function()
+			return game:HttpGet(url, false, { ["Content-Type"] = "application/json" }, "POST", body)
+		end,
+		function()
+			return game:HttpGet(url, "POST", body)
+		end,
+		function()
+			return game:HttpPost(url, body, "application/json")
+		end,
+		function()
+			return game:GetService("HttpService"):PostAsync(url, body, "application/json")
+		end,
+	}
+	if request ~= nil then
+		table.insert(strategies, function()
+			return request({
+				Url = url,
+				Method = "POST",
+				Headers = { ["Content-Type"] = "application/json" },
+				Body = body,
+			})
+		end)
+	end
+	local lastErr = nil
+	for i = 1, #strategies do
+		local ok, resp = pcall(strategies[i])
+		if ok and responseConfirmed(resp) then
+			return true, i
+		end
+		if ok then
+			lastErr = "strategy " .. i .. " returned an unconfirmed response"
+		else
+			lastErr = resp
+		end
+	end
+	return false, lastErr
+end
+
 local function sendDebug(snapshot, texts, phase, message, reason)
 	local cfg = getEnvironment().config
 	local url = DEFAULT_CONFIG.debugUrl
@@ -292,22 +360,25 @@ local function sendDebug(snapshot, texts, phase, message, reason)
 	local body = jsonEncode(payload)
 
 	local function post()
-		local ok = false
-		local err = "no http"
-		if game.HttpGet ~= nil then
-			ok, err = pcall(function() game:HttpGet(url, "POST", body) end)
+		local ok, err = tryHttpPost(url, body)
+		if ok then
+			if reason == "scan" then
+				flashMessage("Scan sent - posted to the debug server")
+			end
+			return
 		end
-		if not ok and game.HttpGetAsync ~= nil then
-			ok, err = pcall(function() game:HttpGetAsync(url, "POST", body) end)
-		end
-		if not ok then
-			warn("[LastToLeaveBox] debug send failed:", err)
+		warn("[LastToLeaveBox] debug send failed:", tostring(err))
+		if reason == "scan" then
+			flashMessage("Scan failed to post: " .. tostring(err))
+		else
+			flashMessage("debug POST failed: " .. tostring(err))
 		end
 	end
 
 	local ok2, err2 = pcall(delay, 0, post)
 	if not ok2 then
-		warn("[LastToLeaveBox] debug send error:", err2)
+		warn("[LastToLeaveBox] debug send error:", tostring(err2))
+		wallState.message = "debug send error: " .. tostring(err2)
 	end
 end
 
@@ -956,7 +1027,6 @@ local function createBot(config)
 	local botOn = config.enabled
 	local lastMessage = ""
 	local lastTick = 0
-	local lastSend = 0
 	local lastPhaseName = ""
 
 	local function setBotState(on)
@@ -1017,16 +1087,16 @@ local function createBot(config)
 				display = CHALLENGE_NAMES[phase] or phase
 			end
 		end
-		wallState.message = display
+		if wallState.scanFlashUntil ~= nil and now < wallState.scanFlashUntil then
+			-- A transient message (scan confirmation / debug error) is on
+			-- screen; leave it alone until it expires.
+		else
+			wallState.message = display
+		end
 
 		if message ~= lastMessage then
 			lastMessage = message
 			reportStatus("Bot: " .. phase .. " - " .. message)
-		end
-
-		if now - lastSend >= 10 then
-			lastSend = now
-			sendDebug(snapshot, texts, phase, message, "periodic")
 		end
 	end
 
@@ -1116,8 +1186,8 @@ local function createBot(config)
 		end
 
 		print("=== Scan end ===")
+		flashMessage("Scan sent - posting to the debug server...")
 		sendDebug(snapshot, texts, lastPhaseName, "", "scan")
-		reportStatus("Scan complete - posted to debug server")
 	end
 
 	local function teardown()
@@ -1133,6 +1203,14 @@ local function createBot(config)
 		for _, connection in ipairs(connections) do
 			connection:Disconnect()
 		end
+
+		for i = 1, #extraCleanup do
+			local ok, err = pcall(extraCleanup[i])
+			if not ok then
+				warn("[LastToLeaveBox] cleanup failed:", tostring(err))
+			end
+		end
+		extraCleanup = {}
 
 		if statusPanelAPI ~= nil then
 			statusPanelAPI.destroy()
@@ -1180,6 +1258,51 @@ local function createBot(config)
 		destroy = teardown,
 		scan = dumpGame,
 	}
+end
+
+-- ---------- Auto data collector ----------
+-- Posts a full snapshot to the debug server on a fixed cadence (default 4s),
+-- independent of the bot being on or off, so we collect calibration data
+-- across many rounds without pressing Scan. First post fires immediately.
+
+local function createCollector(config)
+	local conn = nil
+	local interval = 4
+	if config.autoScanInterval ~= nil and config.autoScanInterval ~= false then
+		interval = config.autoScanInterval
+	end
+	local lastPost = -9999 -- first heartbeat posts right away
+
+	local function tick()
+		local now = os.clock()
+		if now - lastPost < interval then
+			return
+		end
+		lastPost = now
+		local ok, err = pcall(function()
+			local snapshot = scanWorkspace()
+			local texts = collectUIText()
+			local phase = detectPhase(snapshot, texts)
+			sendDebug(snapshot, texts, phase, "auto", "auto")
+		end)
+		if not ok then
+			reportStatus("auto-scan error: " .. tostring(err))
+			flashMessage("auto-scan error: " .. tostring(err))
+		end
+	end
+
+	conn = RunService.Heartbeat:Connect(tick)
+
+	local function destroy()
+		if conn ~= nil then
+			conn:Disconnect()
+			conn = nil
+		end
+	end
+
+	table.insert(extraCleanup, destroy)
+
+	return { destroy = destroy }
 end
 
 -- ---------- Status panel ----------
@@ -1245,6 +1368,7 @@ local function createStatusPanel()
 	local BUTTON_H = 30
 
 	local scanButton = Instance.new("TextButton")
+	scanButton.Name = "ScanButton"
 	scanButton.Size = UDim2.fromOffset(80, BUTTON_H)
 	scanButton.Position = UDim2.fromOffset(10, BUTTON_Y)
 	scanButton.BackgroundColor3 = Color3.fromRGB(60, 140, 160)
@@ -1260,6 +1384,7 @@ local function createStatusPanel()
 	scanCorner.Parent = scanButton
 
 	local botButton = Instance.new("TextButton")
+	botButton.Name = "BotButton"
 	botButton.Size = UDim2.fromOffset(100, BUTTON_H)
 	botButton.Position = UDim2.fromOffset(100, BUTTON_Y)
 	botButton.BackgroundColor3 = Color3.fromRGB(45, 120, 255)
@@ -1275,6 +1400,7 @@ local function createStatusPanel()
 	botCorner.Parent = botButton
 
 	local removeButton = Instance.new("TextButton")
+	removeButton.Name = "RemoveButton"
 	removeButton.Size = UDim2.fromOffset(100, BUTTON_H)
 	removeButton.Position = UDim2.fromOffset(210, BUTTON_Y)
 	removeButton.BackgroundColor3 = Color3.fromRGB(190, 60, 60)
@@ -1388,6 +1514,8 @@ local config = resolveConfig()
 
 local api = createBot(config)
 boundAPI = api
+
+local collector = createCollector(config)
 
 local statusPanel = createStatusPanel()
 if statusPanel ~= nil then
