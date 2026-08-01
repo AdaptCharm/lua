@@ -356,19 +356,22 @@ end
 -- the executor's workspace so no data is lost.
 local function logToFile(line)
 	if appendfile ~= nil then
-		pcall(function() appendfile("last-to-leave-box-debug.jsonl", line .. "\n") end)
+		local ok = pcall(function() appendfile("last-to-leave-box-debug.jsonl", line .. "\n") end)
+		return ok
 	elseif writefile ~= nil then
-		pcall(function()
+		local ok = pcall(function()
 			local existing = ""
 			if readfile ~= nil then
-				local ok, data = pcall(readfile, "last-to-leave-box-debug.jsonl")
-				if ok and data ~= nil then
+				local ok2, data = pcall(readfile, "last-to-leave-box-debug.jsonl")
+				if ok2 and data ~= nil then
 					existing = data
 				end
 			end
 			writefile("last-to-leave-box-debug.jsonl", existing .. line .. "\n")
 		end)
+		return ok
 	end
+	return false
 end
 
 local function sendDebug(snapshot, texts, phase, message, reason)
@@ -391,16 +394,23 @@ local function sendDebug(snapshot, texts, phase, message, reason)
 
 	local function post()
 		local ok, err = tryHttpPost(urls, body)
-		pcall(logToFile, body)
+		local fileOk = logToFile(body)
 		if ok then
 			if reason == "scan" then
 				flashMessage("Scan sent - posted to the debug server")
 			end
 			return
 		end
-		warn("[LastToLeaveBox] debug send failed:", tostring(err))
-		if reason == "scan" or reason == "phase-change" then
-			flashMessage("debug POST failed: " .. string.sub(tostring(err), 1, 120))
+		if fileOk then
+			warn("[LastToLeaveBox] debug send failed, saved to file:", tostring(err))
+			if reason == "scan" or reason == "phase-change" then
+				flashMessage("HTTP blocked - saved to file")
+			end
+		else
+			warn("[LastToLeaveBox] debug send failed:", tostring(err))
+			if reason == "scan" or reason == "phase-change" then
+				flashMessage("debug POST failed: " .. string.sub(tostring(err), 1, 120))
+			end
 		end
 	end
 
@@ -638,6 +648,27 @@ local function detectPhase(snapshot, texts)
 		return false
 	end
 
+	-- Like hazardMatch but requires ALL keywords in a single label, so a
+	-- lobby/menu mention of one word alone (e.g. "HOT POTATO" preview) won't
+	-- match unless the real announcement also includes "explode" or "pass".
+	local function labelHasAll(...)
+		local keywords = { ... }
+		for _, t in ipairs(texts) do
+			local tl = lower(t)
+			local all = true
+			for _, kw in ipairs(keywords) do
+				if string.find(tl, kw, 1, true) == nil then
+					all = false
+					break
+				end
+			end
+			if all then
+				return true
+			end
+		end
+		return false
+	end
+
 	-- The first UI label containing any of these keywords is the challenge
 	-- announcement - that's what we show in the GUI.
 	local function labelFor(keywords)
@@ -653,7 +684,7 @@ local function detectPhase(snapshot, texts)
 	end
 
 	-- Order matters: check the most specific phrases first.
-	if has("fuel") or has("generator") then
+	if labelHasAll("fuel", "generator") then
 		return "generator", labelFor({"fuel", "generator"})
 	end
 	if hazardMatch("laser", {"touch", "avoid", "don't", "dont", "survive", "beam"}) then
@@ -668,7 +699,7 @@ local function detectPhase(snapshot, texts)
 	if #snapshot.slabs > 0 and has("slab") then
 		return "slab", labelFor({"slab"})
 	end
-	if has("potato") then
+	if labelHasAll("potato", "explode") or labelHasAll("potato", "pass") then
 		return "potato", labelFor({"potato"})
 	end
 	if #snapshot.cash > 0 and (has("cash") or has("money") or has("dollar")) then
@@ -683,7 +714,7 @@ local function detectPhase(snapshot, texts)
 	if has("hide") then
 		return "hide", labelFor({"hide"})
 	end
-	if has("jump") then
+	if labelHasAll("jump", "avoid") or labelHasAll("jump", "damage") or labelHasAll("jump", "don't") or labelHasAll("jump", "dont") then
 		return "jump", labelFor({"jump"})
 	end
 	if #snapshot.masks > 0 and (has("gas mask") or has("mask") or has("pick up")) then
