@@ -35,7 +35,25 @@ local Workspace = game:GetService("Workspace")
 
 local LocalPlayer = Players.LocalPlayer
 if LocalPlayer == nil then
+	-- Executors sometimes inject before the player has loaded.
+	task.wait(1)
+	LocalPlayer = Players.LocalPlayer
+end
+
+if LocalPlayer == nil then
+	warn("[LastToLeaveBox] Could not find LocalPlayer — re-execute the script.")
 	return
+end
+
+-- Most executors expose getgenv(); a few do not. Fall back to the
+-- global table so the script still runs either way.
+local function getEnvironment(): Environment
+	local getgenvFn = _G.getgenv
+	if getgenvFn ~= nil then
+		return getgenvFn() :: Environment
+	end
+
+	return _G :: Environment
 end
 
 local DEFAULT_CONFIG: Config = {
@@ -91,7 +109,7 @@ end
 -- The user config is read once, at load, and every field falls back to
 -- its default independently, so a partial config table is fine.
 local function resolveConfig(): Config
-	local userConfig = getgenv().config
+	local userConfig = getEnvironment().config
 
 	return {
 		enabled = resolveBoolean(userConfig and userConfig.enabled, DEFAULT_CONFIG.enabled),
@@ -454,8 +472,11 @@ end
 -- A small status panel in the corner of the screen. It is deliberately
 -- minimal: its job is to show what the script is doing and why it might
 -- not be working, not to clone a full script hub.
-local function createStatusPanel(): StatusPanel
-	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+local function createStatusPanel(): StatusPanel?
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
+	if playerGui == nil then
+		return nil
+	end
 
 	local existing = playerGui:FindFirstChild("LastToLeaveBoxPanel")
 	if existing ~= nil then
@@ -615,11 +636,16 @@ local function createStatusPanel(): StatusPanel
 	}
 end
 
+print("[LastToLeaveBox] Script loaded — starting up.")
+
 -- Re-running the script replaces the previous instance instead of
 -- stacking a second one on top.
-local previousAPI = getgenv().lastToLeaveBox
+local previousAPI = getEnvironment().lastToLeaveBox
 if previousAPI ~= nil then
-	previousAPI.destroy()
+	local ok, err = pcall(previousAPI.destroy)
+	if not ok then
+		warn("[LastToLeaveBox] Failed to clean up the previous instance:", err)
+	end
 end
 
 -- Clean up walls left behind by older versions that had no API.
@@ -632,11 +658,21 @@ end
 local config = resolveConfig()
 
 local statusPanel = createStatusPanel()
-statusPanelAPI = statusPanel
+if statusPanel ~= nil then
+	statusPanelAPI = statusPanel
+else
+	warn("[LastToLeaveBox] PlayerGui was not available — running without the status panel.")
+end
 
 local wallAPI = createWall(config)
 boundAPI = wallAPI
-getgenv().lastToLeaveBox = wallAPI
+
+local ok, regErr = pcall(function()
+	getEnvironment().lastToLeaveBox = wallAPI
+end)
+if not ok then
+	warn("[LastToLeaveBox] Could not register the API (read-only getgenv?):", regErr)
+end
 
 reportStatus(string.format("Loaded on place %d — config.enabled = %s", game.PlaceId, tostring(config.enabled)))
 
