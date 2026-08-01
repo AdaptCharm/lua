@@ -1,31 +1,7 @@
-type Config = {
-	enabled: boolean,
-	autoClearCacheOnDisable: boolean,
-	radius: number,
-	height: number,
-	rotationSpeed: number,
-	attractionStrength: number,
-	maxPartsPerFrame: number,
-}
-
-type WallAPI = {
-	enable: () -> (),
-	disable: () -> (),
-	toggle: () -> (),
-	destroy: () -> (),
-}
-
-type StatusPanel = {
-	setStatus: (text: string) -> (),
-	destroy: () -> (),
-}
-
-type Environment = {
-	config: Config?,
-	lastToLeaveBox: WallAPI?,
-}
-
-declare function getgenv(): Environment
+-- If you see this line in your executor console, execution works and the
+-- problem is further down. If you do NOT see it, the script never ran
+-- (bad load URL, or the executor could not parse the script).
+print("[LastToLeaveBox] loaded (compatibility build)")
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -36,27 +12,27 @@ local Workspace = game:GetService("Workspace")
 local LocalPlayer = Players.LocalPlayer
 if LocalPlayer == nil then
 	-- Executors sometimes inject before the player has loaded.
-	task.wait(1)
+	wait(1)
 	LocalPlayer = Players.LocalPlayer
 end
 
 if LocalPlayer == nil then
-	warn("[LastToLeaveBox] Could not find LocalPlayer — re-execute the script.")
+	warn("[LastToLeaveBox] Could not find LocalPlayer - re-execute the script.")
 	return
 end
 
 -- Most executors expose getgenv(); a few do not. Fall back to the
 -- global table so the script still runs either way.
-local function getEnvironment(): Environment
+local function getEnvironment()
 	local getgenvFn = _G.getgenv
 	if getgenvFn ~= nil then
-		return getgenvFn() :: Environment
+		return getgenvFn()
 	end
 
-	return _G :: Environment
+	return _G
 end
 
-local DEFAULT_CONFIG: Config = {
+local DEFAULT_CONFIG = {
 	enabled = true,
 	autoClearCacheOnDisable = false,
 	radius = 40,
@@ -79,10 +55,10 @@ local wallState = {
 	partCount = 0,
 }
 
-local statusPanelAPI: StatusPanel? = nil
-local boundAPI: WallAPI? = nil
+local statusPanelAPI = nil
+local boundAPI = nil
 
-local function reportStatus(text: string)
+local function reportStatus(text)
 	if statusPanelAPI ~= nil then
 		statusPanelAPI.setStatus(text)
 	end
@@ -90,16 +66,16 @@ local function reportStatus(text: string)
 	warn("[LastToLeaveBox]", text)
 end
 
-local function resolveNumber(value: any, fallback: number): number
-	if typeof(value) ~= "number" then
+local function resolveNumber(value, fallback)
+	if type(value) ~= "number" then
 		return fallback
 	end
 
 	return value
 end
 
-local function resolveBoolean(value: any, fallback: boolean): boolean
-	if typeof(value) ~= "boolean" then
+local function resolveBoolean(value, fallback)
+	if type(value) ~= "boolean" then
 		return fallback
 	end
 
@@ -108,7 +84,7 @@ end
 
 -- The user config is read once, at load, and every field falls back to
 -- its default independently, so a partial config table is fine.
-local function resolveConfig(): Config
+local function resolveConfig()
 	local userConfig = getEnvironment().config
 
 	return {
@@ -122,16 +98,16 @@ local function resolveConfig(): Config
 	}
 end
 
-local function findRootPart(character: Model): BasePart?
+local function findRootPart(character)
 	local rootPart = character:FindFirstChild("HumanoidRootPart")
 	if rootPart ~= nil and rootPart:IsA("BasePart") then
-		return rootPart :: BasePart
+		return rootPart
 	end
 
 	return nil
 end
 
-local function currentCenter(): Vector3
+local function currentCenter()
 	local character = LocalPlayer.Character
 	if character == nil then
 		return Vector3.zero
@@ -145,14 +121,14 @@ local function currentCenter(): Vector3
 	return Vector3.new(rootPart.Position.X, 0, rootPart.Position.Z)
 end
 
-local function ringPartCount(radius: number): number
-	return math.max(1, math.ceil((math.tau * radius) / SEGMENT_LENGTH))
+local function ringPartCount(radius)
+	return math.max(1, math.ceil((math.pi * 2 * radius) / SEGMENT_LENGTH))
 end
 
 -- Builds one wall segment around the origin. The wall is positioned and
 -- rotated as a whole later, so segments only need their local CFrame.
-local function buildRingPart(radius: number, height: number, index: number, total: number): BasePart
-	local angle = (index / total) * math.tau
+local function buildRingPart(radius, height, index, total)
+	local angle = (index / total) * (math.pi * 2)
 	local offset = Vector3.new(math.cos(angle), 0, math.sin(angle)) * radius
 	local position = offset + Vector3.new(0, height / 2, 0)
 
@@ -170,7 +146,7 @@ local function buildRingPart(radius: number, height: number, index: number, tota
 	return part
 end
 
-local function newPrimaryPart(): BasePart
+local function newPrimaryPart()
 	local primaryPart = Instance.new("Part")
 	primaryPart.Anchored = true
 	primaryPart.Transparency = 1
@@ -186,20 +162,20 @@ end
 -- If the server rejects a client-created model, it is destroyed, and a
 -- stale reference would throw on every frame. A fresh lookup simply
 -- returns nil and we treat that as "the wall is gone".
-local function findWallModel(): Model?
+local function findWallModel()
 	local model = Workspace:FindFirstChild(WALL_MODEL_NAME)
 	if model ~= nil and model:IsA("Model") then
-		return model :: Model
+		return model
 	end
 
 	return nil
 end
 
-local function createWall(config: Config): WallAPI
-	local connections: { RBXScriptConnection } = {}
+local function createWall(config)
+	local connections = {}
 
-	local buildConnection: RBXScriptConnection? = nil
-	local rotationConnection: RBXScriptConnection? = nil
+	local buildConnection = nil
+	local rotationConnection = nil
 
 	local active = false
 	local destroyed = false
@@ -207,7 +183,7 @@ local function createWall(config: Config): WallAPI
 	local forceRejectCount = 0
 	local reportedForceRejection = false
 
-	local function setWallState(nowActive: boolean, partCount: number)
+	local function setWallState(nowActive, partCount)
 		wallState.active = nowActive
 		wallState.partCount = partCount
 	end
@@ -230,7 +206,62 @@ local function createWall(config: Config): WallAPI
 			buildConnection = nil
 		end
 
-		reportStatus("The wall was removed by the game — this server rejects client-created parts.")
+		reportStatus("The wall was removed by the game - this server rejects client-created parts.")
+	end
+
+	local function applyAttractionTo(player, center, pullRange)
+		if player == LocalPlayer then
+			return
+		end
+
+		local character = player.Character
+		if character == nil then
+			return
+		end
+
+		local rootPart = findRootPart(character)
+		if rootPart == nil then
+			return
+		end
+
+		local offset = rootPart.Position - center
+		local distance = offset.Magnitude
+		if distance < 1 or distance > pullRange then
+			local velocity = rootPart:FindFirstChild(VELOCITY_NAME)
+			if velocity ~= nil then
+				velocity:Destroy()
+			end
+
+			return
+		end
+
+		-- The force is also looked up fresh: if the server keeps
+		-- destroying it, we stop creating it and say so.
+		local velocity = rootPart:FindFirstChild(VELOCITY_NAME)
+		if velocity == nil then
+			forceRejectCount = forceRejectCount + 1
+
+			if forceRejectCount > 10 then
+				if not reportedForceRejection then
+					reportedForceRejection = true
+					reportStatus("The pull force keeps getting rejected - the wall is not affecting other players.")
+				end
+
+				return
+			end
+
+			velocity = Instance.new("BodyVelocity")
+			velocity.Name = VELOCITY_NAME
+			velocity.MaxForce = Vector3.new(config.attractionStrength, 0, config.attractionStrength)
+			velocity.Parent = rootPart
+		else
+			forceRejectCount = 0
+		end
+
+		-- Aim at the nearest point on the ring so they slam into the wall.
+		local ringPoint = center + (offset / distance) * config.radius
+		local pullDirection = (ringPoint - rootPart.Position).Unit
+		velocity.Velocity = pullDirection * (config.attractionStrength / 10)
 	end
 
 	local function applyAttraction()
@@ -241,70 +272,19 @@ local function createWall(config: Config): WallAPI
 		local center = currentCenter()
 		local pullRange = config.radius * 2
 
-		for _, player in Players:GetPlayers() do
-			if player == LocalPlayer then
-				continue
-			end
-
-			local character = player.Character
-			if character == nil then
-				continue
-			end
-
-			local rootPart = findRootPart(character)
-			if rootPart == nil then
-				continue
-			end
-
-			local offset = rootPart.Position - center
-			local distance = offset.Magnitude
-			if distance < 1 or distance > pullRange then
-				local velocity = rootPart:FindFirstChild(VELOCITY_NAME)
-				if velocity ~= nil then
-					velocity:Destroy()
-				end
-
-				continue
-			end
-
-			-- The force is also looked up fresh: if the server keeps
-			-- destroying it, we stop creating it and say so.
-			local velocity = rootPart:FindFirstChild(VELOCITY_NAME) :: BodyVelocity?
-			if velocity == nil then
-				forceRejectCount += 1
-
-				if forceRejectCount > 10 then
-					if not reportedForceRejection then
-						reportedForceRejection = true
-						reportStatus("The pull force keeps getting rejected — the wall is not affecting other players.")
-					end
-
-					continue
-				end
-
-				velocity = Instance.new("BodyVelocity")
-				velocity.Name = VELOCITY_NAME
-				velocity.MaxForce = Vector3.new(config.attractionStrength, 0, config.attractionStrength)
-				velocity.Parent = rootPart
-			else
-				forceRejectCount = 0
-			end
-
-			-- Aim at the nearest point on the ring so they slam into the wall.
-			local ringPoint = center + (offset / distance) * config.radius
-			local pullDirection = (ringPoint - rootPart.Position).Unit
-			velocity.Velocity = pullDirection * (config.attractionStrength / 10)
+		for _, player in pairs(Players:GetPlayers()) do
+			applyAttractionTo(player, center, pullRange)
 		end
 	end
 
-	local function rotateAndAttract(dt: number)
+	local function rotateAndAttract(dt)
 		local model = findWallModel()
 		if model == nil then
 			handleWallRemoved()
 			return
 		end
 
-		angle += math.rad(config.rotationSpeed) * dt
+		angle = angle + math.rad(config.rotationSpeed) * dt
 		model:PivotTo(CFrame.new(currentCenter()) * CFrame.Angles(0, angle, 0))
 		applyAttraction()
 	end
@@ -334,13 +314,17 @@ local function createWall(config: Config): WallAPI
 		local totalParts = ringPartCount(config.radius)
 		local created = 0
 
-		local build = RunService.Heartbeat:Connect(function()
+		-- Declared before the closure so the callback can disconnect
+		-- itself (a `local x = Connect(function() x end)` closure would
+		-- capture the global x, which is nil).
+		local build = nil
+		build = RunService.Heartbeat:Connect(function()
 			-- A rejected model disappears from Workspace; checking by name
 			-- avoids touching a destroyed instance.
 			if Workspace:FindFirstChild(WALL_MODEL_NAME) ~= model then
 				build:Disconnect()
 				buildConnection = nil
-				reportStatus("The wall was rejected while building — this server filters client-created parts.")
+				reportStatus("The wall was rejected while building - this server filters client-created parts.")
 				return
 			end
 
@@ -349,7 +333,7 @@ local function createWall(config: Config): WallAPI
 			while created < batchEnd do
 				local part = buildRingPart(config.radius, config.height, created, totalParts)
 				part.Parent = model
-				created += 1
+				created = created + 1
 			end
 
 			if created >= totalParts then
@@ -365,7 +349,7 @@ local function createWall(config: Config): WallAPI
 				-- Some servers delete the wall a moment after we build it;
 				-- verify it survived so we can report that instead of
 				-- silently spinning a dead wall.
-				task.delay(2, function()
+				delay(2, function()
 					if active and findWallModel() == nil then
 						handleWallRemoved()
 					end
@@ -414,7 +398,7 @@ local function createWall(config: Config): WallAPI
 			model:Destroy()
 		end
 
-		for _, connection in connections do
+		for _, connection in pairs(connections) do
 			connection:Disconnect()
 		end
 
@@ -438,7 +422,7 @@ local function createWall(config: Config): WallAPI
 			return
 		end
 
-		for _, part in character:GetDescendants() do
+		for _, part in pairs(character:GetDescendants()) do
 			if part:IsA("BasePart") then
 				part.CanCollide = false
 			end
@@ -472,7 +456,7 @@ end
 -- A small status panel in the corner of the screen. It is deliberately
 -- minimal: its job is to show what the script is doing and why it might
 -- not be working, not to clone a full script hub.
-local function createStatusPanel(): StatusPanel?
+local function createStatusPanel()
 	local playerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
 	if playerGui == nil then
 		return nil
@@ -558,17 +542,17 @@ local function createStatusPanel(): StatusPanel?
 	removeCorner.CornerRadius = UDim.new(0, 6)
 	removeCorner.Parent = removeButton
 
-	local panelConnections: { RBXScriptConnection } = {}
+	local panelConnections = {}
 	local lastMessage = ""
 	local lastRefresh = 0
 
-	local function setStatus(text: string)
+	local function setStatus(text)
 		lastMessage = text
 		statusLabel.Text = text
 	end
 
 	local function destroy()
-		for _, connection in panelConnections do
+		for _, connection in pairs(panelConnections) do
 			connection:Disconnect()
 		end
 
@@ -625,9 +609,20 @@ local function createStatusPanel(): StatusPanel?
 		end
 		lastRefresh = now
 
-		local stateText = if wallState.active then string.format("Active — %d parts", wallState.partCount) else "Disabled"
+		local stateText
+		if wallState.active then
+			stateText = string.format("Active - %d parts", wallState.partCount)
+		else
+			stateText = "Disabled"
+		end
+
 		statusLabel.Text = stateText .. "\n" .. lastMessage
-		toggleButton.Text = if wallState.active then "Disable" else "Enable"
+
+		if wallState.active then
+			toggleButton.Text = "Disable"
+		else
+			toggleButton.Text = "Enable"
+		end
 	end))
 
 	return {
@@ -636,7 +631,7 @@ local function createStatusPanel(): StatusPanel?
 	}
 end
 
-print("[LastToLeaveBox] Script loaded — starting up.")
+print("[LastToLeaveBox] starting up...")
 
 -- Re-running the script replaces the previous instance instead of
 -- stacking a second one on top.
@@ -649,7 +644,7 @@ if previousAPI ~= nil then
 end
 
 -- Clean up walls left behind by older versions that had no API.
-for _, model in Workspace:GetChildren() do
+for _, model in pairs(Workspace:GetChildren()) do
 	if model:IsA("Model") and model.Name == WALL_MODEL_NAME then
 		model:Destroy()
 	end
@@ -661,7 +656,7 @@ local statusPanel = createStatusPanel()
 if statusPanel ~= nil then
 	statusPanelAPI = statusPanel
 else
-	warn("[LastToLeaveBox] PlayerGui was not available — running without the status panel.")
+	warn("[LastToLeaveBox] PlayerGui was not available - running without the status panel.")
 end
 
 local wallAPI = createWall(config)
@@ -674,7 +669,7 @@ if not ok then
 	warn("[LastToLeaveBox] Could not register the API (read-only getgenv?):", regErr)
 end
 
-reportStatus(string.format("Loaded on place %d — config.enabled = %s", game.PlaceId, tostring(config.enabled)))
+reportStatus(string.format("Loaded on place %d - config.enabled = %s", game.PlaceId, tostring(config.enabled)))
 
 if config.enabled then
 	local ok, err = pcall(wallAPI.enable)
@@ -682,5 +677,5 @@ if config.enabled then
 		reportStatus("Failed to start the wall: " .. tostring(err))
 	end
 else
-	reportStatus("Disabled by config — press RightShift or the Enable button to start.")
+	reportStatus("Disabled by config - press RightShift or the Enable button to start.")
 end
