@@ -344,6 +344,7 @@ local function buildPayload(snapshot, texts, phase, message, reason)
 	payload.potatoes = catTable(snapshot.potatoes)
 	payload.generators = catTable(snapshot.generators)
 	payload.buttons = catTable(snapshot.buttons)
+	payload.vivid = catTable(snapshot.vivid, 20)
 	return payload
 end
 
@@ -588,6 +589,10 @@ local function scanWorkspace()
 		potatoes = {},
 		generators = {},
 		buttons = {},
+		-- Calibration: small anchored parts with vivid colours. The plate
+		-- round's plates have unrecognized names, so this list reveals what a
+		-- plate actually looks like for the colour-match logic.
+		vivid = {},
 		workspaceChildren = {},
 	}
 
@@ -632,6 +637,17 @@ local function scanWorkspace()
 				if #snapshot.buttons < 20 then
 					table.insert(snapshot.buttons, obj)
 				end
+			elseif obj.Anchored == true and obj.Size ~= nil and obj.Size.X <= 6 and obj.Size.Y <= 6 and obj.Size.Z <= 6 then
+				-- Small vivid anchored part: likely a plate, fuel can or prop.
+				-- Captured for calibration (payload field "vivid").
+				local c = obj.Color
+				if c ~= nil then
+					local mx = math.max(c.R, c.G, c.B)
+					local mn = math.min(c.R, c.G, c.B)
+					if mx - mn >= 0.35 and #snapshot.vivid < 24 then
+						table.insert(snapshot.vivid, obj)
+					end
+				end
 			end
 		end
 	end
@@ -660,6 +676,7 @@ local CHALLENGE_NAMES = {
 	chair = "SIT DOWN",
 	floor = "DON'T FALL",
 	button = "PRESS THE BUTTON",
+	circle = "RUN TO THE CIRCLE",
 }
 
 local function detectPhase(snapshot, texts)
@@ -733,6 +750,11 @@ local function detectPhase(snapshot, texts)
 	-- " PRESS BUTTON !" - a reaction-time round; we find and click the button.
 	if has("press button") or has("press the button") then
 		return "button", labelFor({"press button", "press the button"})
+	end
+	-- "⭕ The Circle ⭕" / "Run to the circle! time left: Xs" - the arena
+	-- floor drops away and everyone must stand inside the ring.
+	if has("the circle") or has("run to the circle") or labelHasAll("circle", "run") then
+		return "circle", labelFor({"circle"})
 	end
 	if hazardMatch("laser", {"touch", "avoid", "don't", "dont", "survive", "beam"}) then
 		return "laser", labelFor({"laser"})
@@ -846,9 +868,19 @@ end
 
 -- ---------- Phase handlers ----------
 
+-- Y of the top face of a part (guards against nil Size in odd cases).
+local function partTopY(part)
+	local y = part.Position.Y
+	if part.Size ~= nil then
+		y = y + part.Size.Y / 2
+	end
+	return y
+end
+
 local cycle = {
 	fuel = 1,
 	fuelT = 0,
+	fuelStep = "grab", -- generator round: "grab" the can, then "deliver" it
 	bomb = 1,
 	bombT = 0,
 	cash = 1,
@@ -879,28 +911,132 @@ local function handleJump()
 	return "jumping to avoid damage"
 end
 
-local function handleGenerator(snapshot)
-	local fuel = snapshot.fuel
-	if #fuel == 0 then
-		return "no fuel found"
+-- The generator we should fill: the one matching our team colour when the
+-- game uses Blue/Red teams, otherwise the nearest generator.
+local function myGenerator(snapshot)
+	local gens = snapshot.generators
+	if #gens == 0 then
+		return nil
 	end
-	if cycle.fuel > #fuel then
-		cycle.fuel = 1
-	end
-	if os.clock() - cycle.fuelT >= 0.5 then
-		cycle.fuelT = os.clock()
-		cycle.fuel = cycle.fuel + 1
-		if cycle.fuel > #fuel then
-			cycle.fuel = 1
+	local wantBlue = nil
+	pcall(function()
+		local tc = LocalPlayer.TeamColor
+		if tc ~= nil and tc.Color ~= nil then
+			local c = tc.Color
+			if c.B > c.R then
+				wantBlue = true
+			elseif c.R > c.B then
+				wantBlue = false
+			end
+		end
+	end)
+	for _, g in ipairs(gens) do
+		if wantBlue == true and g.Name == "Blue" then
+			return g
+		end
+		if wantBlue == false and g.Name == "Red" then
+			return g
 		end
 	end
-	local item = fuel[cycle.fuel]
-	teleportTo(item.Position + Vector3.new(0, 3, 0))
-	local gens = snapshot.generators
-	if #gens > 0 and cycle.fuel % 3 == 0 then
-		teleportTo(gens[1].Position + Vector3.new(0, 3, 0))
+	local root = getRootPart()
+	local best, bestD = nil, math.huge
+	for _, g in ipairs(gens) do
+		local d = 0
+		if root ~= nil then
+			d = (root.Position - g.Position).Magnitude
+		end
+		if d < bestD then
+			best, bestD = g, d
+		end
 	end
-	return "fueling the generator"
+	return best
+end
+
+-- The fuel round: grab a fuel can, carry it to our generator and press its
+-- button, then repeat. The fuel can is a moving red "Mark" part that the
+-- name-based fuel scan never catches, so we also scan the workspace for it
+-- (it usually shows up in the floors bucket via its parent's name).
+local function handleGenerator(snapshot)
+	local can = nil
+	local root = getRootPart()
+	local bestD = math.huge
+	local function consider(part)
+		if part == nil then
+			return
+		end
+		local d = 0
+		if root ~= nil then
+			d = (root.Position - part.Position).Magnitude
+		end
+		if d < bestD then
+			can = part
+			bestD = d
+		end
+	end
+	for _, fu in ipairs(snapshot.fuel) do
+		consider(fu)
+	end
+	for _, fl in ipairs(snapshot.floors) do
+		if lower(fl.Name) == "mark" then
+			consider(fl)
+		end
+	end
+	pcall(function()
+		for _, obj in ipairs(Workspace:GetDescendants()) do
+			if obj:IsA("BasePart") and not isPartOfCharacter(obj) then
+				local n = lower(obj.Name)
+				if n == "mark" or isMatch(n, {"fuel", "canister", "jerry", "gasoline"}) then
+					consider(obj)
+				end
+			end
+		end
+	end)
+
+	if can == nil then
+		return "no fuel can found"
+	end
+
+	local now = os.clock()
+	if cycle.fuelT == 0 then
+		cycle.fuelT = now
+	end
+	if cycle.fuelStep == "grab" then
+		if now - cycle.fuelT >= 1.0 then
+			-- Picked it up (or at least tried): head to the generator.
+			cycle.fuelStep = "deliver"
+			cycle.fuelT = now
+		else
+			-- Keep the character overlapping the can so the pickup fires.
+			teleportTo(can.Position + Vector3.new(0, 2, 0))
+			return "grabbing the fuel can"
+		end
+	end
+
+	-- deliver: stand on the generator and press its button.
+	local gen = myGenerator(snapshot)
+	if gen == nil then
+		cycle.fuelStep = "grab"
+		cycle.fuelT = now
+		return "no generator found"
+	end
+	if now - cycle.fuelT >= 1.5 then
+		cycle.fuelStep = "grab"
+		cycle.fuelT = now
+	end
+	local genTop = partTopY(gen)
+	teleportTo(Vector3.new(gen.Position.X, genTop + 3, gen.Position.Z))
+	pcall(function()
+		for _, child in ipairs(gen:GetDescendants()) do
+			if child:IsA("ClickDetector") then
+				child:MouseClick(LocalPlayer)
+			elseif child:IsA("ProximityPrompt") then
+				if ProximityPromptService ~= nil then
+					ProximityPromptService:PromptButtonHoldBegan(child, LocalPlayer)
+				end
+			end
+		end
+	end)
+	return "filling the generator"
 end
 
 local function handleBomb(snapshot)
@@ -1035,6 +1171,19 @@ local function handleButton(snapshot)
 	local buttons = snapshot.buttons
 	if #buttons > 0 then
 		local root = getRootPart()
+		-- Prefer parts actually named like a button: the bucket also contains
+		-- pedestal/shop parts that merely carry a ClickDetector, and the real
+		-- round button ("BUTTON PRESS") must win over those.
+		local named = {}
+		for _, b in ipairs(buttons) do
+			if isMatch(b.Name, {"button", "press", "switch", "lever"}) then
+				named[#named + 1] = b
+			end
+		end
+		if #named > 0 then
+			buttons = named
+		end
+
 		local best = nil
 		local bestD = math.huge
 		for _, b in ipairs(buttons) do
@@ -1048,7 +1197,11 @@ local function handleButton(snapshot)
 			end
 		end
 		if best ~= nil then
-			teleportTo(best.Position + Vector3.new(0, 3, 0))
+			-- Stand ON the pad (feet at its top) instead of 3 studs above it:
+			-- with collision restored the character then lands on the pad and
+			-- stays in contact instead of falling through and dying.
+			local standY = partTopY(best)
+			teleportTo(Vector3.new(best.Position.X, standY + 3, best.Position.Z))
 			-- Try to actually press it: ClickDetector and ProximityPrompt
 			-- buttons can both be triggered client-side.
 			local pressed = false
@@ -1085,6 +1238,18 @@ local function handleChair(snapshot)
 		return "no chairs found"
 	end
 
+	-- Prefer the actual Seat parts (in this game a "chair" is a model of
+	-- legs/back/seat parts); only fall back to the whole bucket.
+	local seats = {}
+	for _, c in ipairs(chairs) do
+		if c:IsA("Seat") or c:IsA("VehicleSeat") then
+			seats[#seats + 1] = c
+		end
+	end
+	if #seats > 0 then
+		chairs = seats
+	end
+
 	local now = os.clock()
 	if cycle.chairT ~= 0 and now - cycle.chairT < 1.0 then
 		-- We sat recently and got unseated: hold still briefly before the
@@ -1107,6 +1272,92 @@ local function handleChair(snapshot)
 	return "sitting on chair " .. cycle.chair
 end
 
+-- Announcement text: 'Stand on the plate with the desired
+-- <font color="rgb(127,255,0)">color</font> time left: 10s' - the wanted
+-- colour is inside the rgb() in the label. Returns r,g,b in 0..1.
+local function parseTargetColor()
+	local texts = collectUIText()
+	for _, t in ipairs(texts) do
+		local r, g, b = string.match(t, "rgb%s*%(%s*(%d+)%s*,%s*(%d+)%s*,%s*(%d+)%s*%)")
+		if r ~= nil then
+			return tonumber(r) / 255, tonumber(g) / 255, tonumber(b) / 255
+		end
+	end
+	return nil
+end
+
+local function handlePlate(snapshot)
+	local tr, tg, tb = parseTargetColor()
+	if tr == nil then
+		-- No announcement yet (or it just faded): keep the old fly-up
+		-- behaviour so we don't fall through the map.
+		return flyUp()
+	end
+
+	-- Scan every BasePart for the target colour. The plates have generic
+	-- names, so the name-based buckets never see them - only a colour scan
+	-- of the whole workspace finds them.
+	local root = getRootPart()
+	local best, bestD = nil, math.huge
+	pcall(function()
+		for _, obj in ipairs(Workspace:GetDescendants()) do
+			if obj:IsA("BasePart") and not isPartOfCharacter(obj) then
+				local c = obj.Color
+				local s = obj.Size
+				local big = s ~= nil and (s.X > 8 or s.Y > 8 or s.Z > 8)
+				-- Skip big map geometry (floors, walls, red corner blocks).
+				if c ~= nil and not big
+					and math.abs(c.R - tr) <= 0.2 and math.abs(c.G - tg) <= 0.2 and math.abs(c.B - tb) <= 0.2 then
+					local d = 0
+					if root ~= nil then
+						d = (root.Position - obj.Position).Magnitude
+					end
+					if d < bestD then
+						best = obj
+						bestD = d
+					end
+				end
+			end
+		end
+	end)
+	if best == nil then
+		return flyUp() .. " (no matching plate)"
+	end
+	local topY = partTopY(best)
+	teleportTo(Vector3.new(best.Position.X, topY + 3, best.Position.Z))
+	return "standing on the rgb(" .. math.floor(tr * 255 + 0.5) .. ","
+		.. math.floor(tg * 255 + 0.5) .. "," .. math.floor(tb * 255 + 0.5) .. ") plate"
+end
+
+-- "Run to the circle!": the arena floor drops away and everyone must stand
+-- inside the big red ring ("Hollow Circle / Ring") in the middle.
+local function handleCircle(snapshot)
+	local ring = nil
+	for _, fl in ipairs(snapshot.floors) do
+		if fl.Name == "Hollow Circle / Ring" or isMatch(fl.Name, {"circle", "ring"}) then
+			ring = fl
+			break
+		end
+	end
+	if ring == nil then
+		pcall(function()
+			for _, obj in ipairs(Workspace:GetDescendants()) do
+				if obj:IsA("BasePart") and (obj.Name == "Hollow Circle / Ring" or isMatch(obj.Name, {"circle", "ring"})) then
+					ring = obj
+					break
+				end
+			end
+		end)
+	end
+	if ring == nil then
+		return flyUp()
+	end
+	-- Stand in the middle of the ring - that's the safe zone.
+	local topY = partTopY(ring)
+	teleportTo(Vector3.new(ring.Position.X, topY + 3, ring.Position.Z))
+	return "inside the circle"
+end
+
 local HANDLERS = {
 	jump = handleJump,
 	laser = flyUp,
@@ -1117,7 +1368,7 @@ local HANDLERS = {
 	floor = flyUp,
 	generator = handleGenerator,
 	slab = flyUp,
-	plate = flyUp,
+	plate = handlePlate,
 	button = handleButton,
 	bomb = handleBomb,
 	cash = handleCash,
@@ -1126,6 +1377,7 @@ local HANDLERS = {
 	ball = handleBall,
 	potato = handlePotato,
 	chair = handleChair,
+	circle = handleCircle,
 }
 
 local FLY_PHASES = {
@@ -1138,6 +1390,7 @@ local FLY_PHASES = {
 	slab = true,
 	plate = true,
 	button = true,
+	circle = true,
 }
 
 -- ---------- Bot ----------
@@ -1183,8 +1436,8 @@ local function createBot(config)
 			end
 			if phase == "bomb" then cycle.bomb = 1 cycle.bombT = os.clock() end
 			if phase == "cash" then cycle.cash = 1 cycle.cashT = os.clock() end
-			if phase == "generator" then cycle.fuel = 1 cycle.fuelT = os.clock() end
-			if phase == "chair" then cycle.chair = 1 end
+			if phase == "generator" then cycle.fuel = 1 cycle.fuelT = os.clock() cycle.fuelStep = "grab" end
+			if phase == "chair" then cycle.chair = 1 cycle.chairT = 0 end
 			sendDebug(snapshot, texts, phase, "", "phase-change")
 		end
 		lastPhaseName = phase
@@ -1380,10 +1633,18 @@ local function createBot(config)
 			return
 		end
 
-		local collide = (lastPhaseName == "jump")
+		-- Rounds where the character must stay grounded restore collision:
+		-- jump (needs to land to re-jump), chair (sit without falling through
+		-- the floor), button (stand on the pad so the press registers),
+		-- plate (stand on the coloured plate), circle (stand inside the ring)
+		-- and generator (grab the fuel can / stand on the generator). In all
+		-- of these a noclip character falls straight through the floor.
+		local grounded = (lastPhaseName == "jump" or lastPhaseName == "chair"
+			or lastPhaseName == "button" or lastPhaseName == "plate"
+			or lastPhaseName == "circle" or lastPhaseName == "generator")
 		for _, part in ipairs(character:GetDescendants()) do
 			if part:IsA("BasePart") then
-				part.CanCollide = collide
+				part.CanCollide = grounded
 			end
 		end
 	end))
