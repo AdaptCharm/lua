@@ -67,7 +67,7 @@ local function getEnvironment()
 end
 
 local DEFAULT_CONFIG = {
-	enabled = true,
+	enabled = false,
 	debugUrl = "https://ghost-vast-stag.ngrok-free.app/api/debug",
 }
 
@@ -524,9 +524,20 @@ end
 
 local function collectUIText()
 	local texts = {}
-	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-	if playerGui == nil then
-		return texts
+	local seen = {}
+
+	local function addText(t)
+		if t == nil or t == "" then
+			return
+		end
+		t = tostring(t)
+		if seen[t] then
+			return
+		end
+		seen[t] = true
+		if #texts < 40 then
+			texts[#texts + 1] = t
+		end
 	end
 
 	local function walk(inst)
@@ -537,10 +548,7 @@ local function collectUIText()
 		end
 
 		if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
-			local t = inst.Text
-			if t ~= nil and t ~= "" then
-				table.insert(texts, t)
-			end
+			addText(inst.Text)
 		end
 
 		for _, child in ipairs(inst:GetChildren()) do
@@ -548,7 +556,41 @@ local function collectUIText()
 		end
 	end
 
-	walk(playerGui)
+	local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+	if playerGui ~= nil then
+		walk(playerGui)
+	end
+
+	-- Challenge announcements often float above the arena in a BillboardGui
+	-- or SurfaceGui instead of PlayerGui - scan Workspace for those too.
+	local visited = 0
+	local function walkWorkspace(inst)
+		visited = visited + 1
+		if visited > 3000 then
+			return -- keep the per-tick scan cheap on mobile
+		end
+		if inst.Name == "L2LB_FlyPad" then
+			return
+		end
+		if inst:IsA("TextLabel") or inst:IsA("TextButton") or inst:IsA("TextBox") then
+			-- Only collect text that lives under a GuiObject so random part
+			-- names or world props can't pollute the detection.
+			local p = inst.Parent
+			while p ~= nil do
+				if p:IsA("BillboardGui") or p:IsA("SurfaceGui") then
+					addText(inst.Text)
+					break
+				end
+				p = p.Parent
+			end
+		end
+		for _, child in ipairs(inst:GetChildren()) do
+			walkWorkspace(child)
+		end
+	end
+
+	pcall(function() walkWorkspace(Workspace) end)
+
 	return texts
 end
 
@@ -1272,7 +1314,11 @@ local function createBot(config)
 		end
 
 		print("=== Scan end ===")
-		wallState.lastRawTexts = table.concat(texts, " | ")
+		if #texts > 0 then
+			wallState.lastRawTexts = "UI texts (" .. #texts .. "): " .. table.concat(texts, " | ")
+		else
+			wallState.lastRawTexts = "UI texts (0): none found"
+		end
 		flashMessage("Scan sent - posting to the debug server...")
 		sendDebug(snapshot, texts, lastPhaseName, "", "scan")
 	end
@@ -1325,7 +1371,13 @@ local function createBot(config)
 	end))
 
 	-- Character no-collide: let us walk through parts the bot teleports us to.
+	-- Only while the bot is ON - with the bot off it would make the character
+	-- fall through the floor (CanCollide=false on the root part = noclip).
 	table.insert(connections, RunService.Stepped:Connect(function()
+		if not botOn then
+			return
+		end
+
 		local character = LocalPlayer.Character
 		if character == nil then
 			return
@@ -1369,7 +1421,11 @@ local function createCollector(config)
 		local ok, err = pcall(function()
 			local snapshot = scanWorkspace()
 			local texts = collectUIText()
-			wallState.lastRawTexts = table.concat(texts, " | ")
+			if #texts > 0 then
+				wallState.lastRawTexts = "UI texts (" .. #texts .. "): " .. table.concat(texts, " | ")
+			else
+				wallState.lastRawTexts = "UI texts (0): none found"
+			end
 			local phase = detectPhase(snapshot, texts)
 			sendDebug(snapshot, texts, phase, "auto", "auto")
 		end)
@@ -1414,7 +1470,7 @@ local function createStatusPanel()
 	local frame = Instance.new("Frame")
 	frame.Name = "Panel"
 	frame.AnchorPoint = Vector2.new(1, 1)
-	frame.Size = UDim2.fromOffset(320, 190)
+	frame.Size = UDim2.fromOffset(320, 200)
 	frame.Position = UDim2.new(1, -12, 1, -12)
 	frame.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
 	frame.BorderSizePixel = 0
@@ -1477,7 +1533,7 @@ local function createStatusPanel()
 	botButton.Size = UDim2.fromOffset(100, BUTTON_H)
 	botButton.Position = UDim2.fromOffset(100, BUTTON_Y)
 	botButton.BackgroundColor3 = Color3.fromRGB(45, 120, 255)
-	botButton.Text = "Bot: ON"
+	botButton.Text = "Bot: " .. (wallState.botOn and "ON" or "OFF")
 	botButton.TextColor3 = Color3.new(1, 1, 1)
 	botButton.Font = Enum.Font.SourceSansBold
 	botButton.TextSize = 14
@@ -1507,13 +1563,13 @@ local function createStatusPanel()
 	-- Raw texts from the last scan/auto, so the user can screenshot and share.
 	local rawTextsLabel = Instance.new("TextLabel")
 	rawTextsLabel.Name = "RawTextsLabel"
-	rawTextsLabel.Size = UDim2.new(1, -20, 0, 46)
-	rawTextsLabel.Position = UDim2.fromOffset(10, 138)
+	rawTextsLabel.Size = UDim2.new(1, -20, 0, 52)
+	rawTextsLabel.Position = UDim2.fromOffset(10, 140)
 	rawTextsLabel.BackgroundTransparency = 1
 	rawTextsLabel.Text = ""
-	rawTextsLabel.TextColor3 = Color3.fromRGB(140, 150, 170)
+	rawTextsLabel.TextColor3 = Color3.fromRGB(220, 230, 240)
 	rawTextsLabel.Font = Enum.Font.SourceSans
-	rawTextsLabel.TextSize = 11
+	rawTextsLabel.TextSize = 12
 	rawTextsLabel.TextXAlignment = Enum.TextXAlignment.Left
 	rawTextsLabel.TextYAlignment = Enum.TextYAlignment.Top
 	rawTextsLabel.TextWrapped = true
