@@ -1,4 +1,42 @@
-print("[LastToLeaveBox] loaded (challenge bot)")
+--[[
+	"Last to leave the box" - challenge auto-bot (v5)
+
+	Client physics forces can't push other players (they are simulated on
+	their clients and rejected), so this bot wins each challenge for YOU
+	using primitives that work client-side:
+		- teleport: move your own character via HumanoidRootPart.CFrame
+		- anchor:   set parts to anchored (best effort)
+		- fly pad:  client-created anchored transparent part to stand on
+
+	Challenges handled (detected from UI text + object names):
+		jump    - keep the character jumping
+		laser   - fly above the laser
+		lava    - fly above the lava
+		abyss   - fly high so you can't fall in
+		generator - touch the fuel cans (and the generator)
+		slab    - anchor the red slabs, stand on a safe one
+		hide    - fly high
+		tiles   - fly high so you can't fall through
+		bomb    - teleport to every bomb and hold the defuse button
+		cash    - teleport to every cash pickup
+		above   - teleport above the highest other player
+		mask    - teleport onto the gas mask
+		ball    - chase the falling balls
+		potato  - stand next to the nearest player (best effort)
+		plate   - read the announced color, stand on the matching plate
+		chair   - sit on a chair; once seated, stop moving (no loop)
+		floor   - fly high (falling-floor challenge)
+
+	Debug relay: presses Scan (and phase changes / every 10s) POST a JSON
+	snapshot to https://ghost-vast-stag.ngrok-free.app/api/debug
+	(config.debugUrl, set to false to disable). The ngrok tunnel forwards
+	to the local debug_server.py on port 8123.
+
+	Buttons: [Scan] dumps game state + posts to the debug server, [Bot]
+	toggles, [Remove] tears down. RightShift toggles the bot.
+]]
+
+print("[LastToLeaveBox] loaded (challenge bot v5)")
 
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -27,33 +65,23 @@ end
 
 local DEFAULT_CONFIG = {
 	enabled = true,
+	debugUrl = "https://ghost-vast-stag.ngrok-free.app/api/debug",
 }
 
--- Shared state for the panel.
+-- Shared state for the panel and the bot.
 local wallState = {
 	botOn = false,
-	message = "",
+	message = "watching for a challenge.",
 }
 
 local statusPanelAPI = nil
 local boundAPI = nil
 
 local function reportStatus(text)
-	if statusPanelAPI ~= nil then
-		statusPanelAPI.setStatus(text)
-	end
-
 	warn("[LastToLeaveBox]", text)
 end
 
 -- ---------- Config ----------
-
-local function resolveNumber(value, fallback)
-	if type(value) ~= "number" then
-		return fallback
-	end
-	return value
-end
 
 local function resolveBoolean(value, fallback)
 	if type(value) ~= "boolean" then
@@ -64,8 +92,13 @@ end
 
 local function resolveConfig()
 	local userConfig = getEnvironment().config
+	local debugUrl = DEFAULT_CONFIG.debugUrl
+	if userConfig ~= nil and userConfig.debugUrl ~= nil and userConfig.debugUrl ~= false then
+		debugUrl = userConfig.debugUrl
+	end
 	return {
 		enabled = resolveBoolean(userConfig and userConfig.enabled, DEFAULT_CONFIG.enabled),
+		debugUrl = debugUrl,
 	}
 end
 
@@ -112,6 +145,172 @@ local function lower(text)
 	return string.lower(text or "")
 end
 
+-- ---------- JSON encoder (plain Lua 5.1) ----------
+
+local function jsonEscape(s)
+	s = string.gsub(s, "\\", "\\\\")
+	s = string.gsub(s, '"', '\\"')
+	s = string.gsub(s, "\n", "\\n")
+	s = string.gsub(s, "\r", "\\r")
+	s = string.gsub(s, "\t", "\\t")
+	return s
+end
+
+local function jsonEncode(v)
+	local t = type(v)
+	if t == "nil" then
+		return "null"
+	elseif t == "boolean" then
+		if v then return "true" end
+		return "false"
+	elseif t == "number" then
+		if v ~= v then return "null" end
+		if v == math.huge or v == -math.huge then return "null" end
+		if v % 1 == 0 and math.abs(v) < 1e15 then
+			return string.format("%d", v)
+		end
+		return string.format("%.3f", v)
+	elseif t == "string" then
+		return '"' .. jsonEscape(v) .. '"'
+	elseif t == "table" then
+		local isArray = true
+		for k in pairs(v) do
+			if type(k) ~= "number" or k < 1 or k % 1 ~= 0 then
+				isArray = false
+				break
+			end
+		end
+		if isArray then
+			local parts = {}
+			for i = 1, #v do
+				parts[i] = jsonEncode(v[i])
+			end
+			return "[" .. table.concat(parts, ",") .. "]"
+		end
+		local parts = {}
+		for k, val in pairs(v) do
+			table.insert(parts, jsonEncode(tostring(k)) .. ":" .. jsonEncode(val))
+		end
+		return "{" .. table.concat(parts, ",") .. "}"
+	end
+	return '"' .. jsonEscape(tostring(v)) .. '"'
+end
+
+-- ---------- Debug relay ----------
+
+local function posTable(v)
+	if v == nil then
+		return nil
+	end
+	return {
+		x = tonumber(string.format("%.1f", v.X)),
+		y = tonumber(string.format("%.1f", v.Y)),
+		z = tonumber(string.format("%.1f", v.Z)),
+	}
+end
+
+local function objTable(part)
+	local t = {
+		name = part.Name,
+		class = part.ClassName,
+	}
+	local p = part.Position
+	if p ~= nil then
+		t.pos = posTable(p)
+	end
+	local s = part.Size
+	if s ~= nil then
+		t.size = posTable(s)
+	end
+	local c = part.Color
+	if c ~= nil then
+		t.color = {
+			r = tonumber(string.format("%.2f", c.R)),
+			g = tonumber(string.format("%.2f", c.G)),
+			b = tonumber(string.format("%.2f", c.B)),
+		}
+	end
+	if part.Anchored ~= nil then
+		t.anchored = part.Anchored
+	end
+	return t
+end
+
+local function catTable(list, max)
+	local out = {}
+	local n = math.min(#list, max or 40)
+	for i = 1, n do
+		out[i] = objTable(list[i])
+	end
+	return out
+end
+
+local function buildPayload(snapshot, texts, phase, message, reason)
+	local root = getRootPart()
+	local payload = {
+		t = os.time(),
+		reason = reason,
+		placeId = tostring(game.PlaceId),
+		botOn = wallState.botOn,
+		phase = phase,
+		message = message,
+		ui = {},
+		root = nil,
+	}
+	if root ~= nil then
+		payload.root = posTable(root.Position)
+	end
+	local n = math.min(#texts, 12)
+	for i = 1, n do
+		payload.ui[i] = string.sub(texts[i], 1, 200)
+	end
+	payload.masks = catTable(snapshot.masks)
+	payload.chairs = catTable(snapshot.chairs)
+	payload.bombs = catTable(snapshot.bombs)
+	payload.plates = catTable(snapshot.plates)
+	payload.floors = catTable(snapshot.floors)
+	payload.fuel = catTable(snapshot.fuel)
+	payload.slabs = catTable(snapshot.slabs)
+	payload.cash = catTable(snapshot.cash)
+	payload.balls = catTable(snapshot.balls)
+	payload.potatoes = catTable(snapshot.potatoes)
+	payload.generators = catTable(snapshot.generators)
+	return payload
+end
+
+local function sendDebug(snapshot, texts, phase, message, reason)
+	local cfg = getEnvironment().config
+	local url = DEFAULT_CONFIG.debugUrl
+	if cfg ~= nil and cfg.debugUrl ~= nil then
+		if cfg.debugUrl == false then
+			return
+		end
+		url = cfg.debugUrl
+	end
+
+	local payload = buildPayload(snapshot, texts, phase, message, reason)
+	local body = jsonEncode(payload)
+
+	local function post()
+		local ok = false
+		local err = "no http"
+		if game.HttpGet ~= nil then
+			ok, err = pcall(function() game:HttpGet(url, "POST", body) end)
+		end
+		if not ok and game.HttpGetAsync ~= nil then
+			ok, err = pcall(function() game:HttpGetAsync(url, "POST", body) end)
+		end
+		if not ok then
+			warn("[LastToLeaveBox] debug send failed:", err)
+		end
+	end
+
+	local ok2, err2 = pcall(delay, 0, post)
+	if not ok2 then
+		warn("[LastToLeaveBox] debug send error:", err2)
+	end
+end
+
 -- ---------- Color helpers ----------
 
 local COLOR_MAP = {
@@ -140,24 +339,64 @@ local function findColorInText(text)
 	return nil
 end
 
-local function closestPlate(plates, targetColor)
-	local best = nil
-	local bestDist = math.huge
+-- Best-matching color NAME for a plate's RGB, using hue so off-shade plate
+-- colors ("red" plates that are actually dark red / orange-red) still match
+-- "red". RGB-distance matching fails here (a dark red is closer to brown).
+local function classifyColor(c)
+	local max = math.max(c.R, c.G, c.B)
+	local min = math.min(c.R, c.G, c.B)
+	local d = max - min
+	local value = max
 
-	for _, part in ipairs(plates) do
-		local c = part.Color
-		local d = math.abs(c.R - targetColor.R) + math.abs(c.G - targetColor.G) + math.abs(c.B - targetColor.B)
-		if d < bestDist then
-			best = part
-			bestDist = d
+	-- No dominant hue: white or black.
+	if d < 0.15 then
+		if value > 0.5 then
+			return "white"
+		end
+		return "black"
+	end
+
+	-- Hue in degrees 0..360.
+	local h = 0
+	if max == c.R then
+		h = ((c.G - c.B) / d) % 6
+	elseif max == c.G then
+		h = (c.B - c.R) / d + 2
+	else
+		h = (c.R - c.G) / d + 4
+	end
+	h = h * 60
+
+	local hueNames = {
+		{ "red", 0 },
+		{ "orange", 30 },
+		{ "yellow", 60 },
+		{ "lime", 90 },
+		{ "green", 120 },
+		{ "cyan", 180 },
+		{ "blue", 240 },
+		{ "purple", 275 },
+		{ "magenta", 300 },
+		{ "pink", 330 },
+		{ "red", 360 },
+	}
+	local best = "red"
+	local bestD = math.huge
+	for _, e in ipairs(hueNames) do
+		local dd = math.abs(h - e[2])
+		if dd > 180 then
+			dd = 360 - dd
+		end
+		if dd < bestD then
+			best = e[1]
+			bestD = dd
 		end
 	end
-
-	if best ~= nil and bestDist < 0.5 then
-		return best
+	-- Dark reds/oranges read as brown.
+	if (best == "red" or best == "orange") and value < 0.45 then
+		return "brown"
 	end
-
-	return nil
+	return best
 end
 
 -- ---------- Object scanning ----------
@@ -181,8 +420,7 @@ local function collectUIText()
 
 	local function walk(inst)
 		-- Never read text from our own panel - the status line contains phase
-		-- keywords ("walking onto the gas mask", ...) that would otherwise
-		-- keep the bot stuck in the wrong phase forever.
+		-- keywords that would otherwise keep the bot stuck in a wrong phase.
 		if inst.Name == "LastToLeaveBoxPanel" then
 			return
 		end
@@ -210,6 +448,12 @@ local function scanWorkspace()
 		bombs = {},
 		plates = {},
 		floors = {},
+		fuel = {},
+		slabs = {},
+		cash = {},
+		balls = {},
+		potatoes = {},
+		generators = {},
 	}
 
 	for _, obj in ipairs(Workspace:GetDescendants()) do
@@ -221,6 +465,18 @@ local function scanWorkspace()
 
 			if isMatch(obj.Name, {"mask", "gas"}) or isMatch(parentName, {"mask", "gas"}) then
 				table.insert(snapshot.masks, obj)
+			elseif isMatch(obj.Name, {"fuel", "canister", "jerry", "gasoline"}) or isMatch(parentName, {"fuel", "canister", "jerry", "gasoline"}) then
+				table.insert(snapshot.fuel, obj)
+			elseif isMatch(obj.Name, {"generator"}) or isMatch(parentName, {"generator"}) then
+				table.insert(snapshot.generators, obj)
+			elseif isMatch(obj.Name, {"slab"}) or isMatch(parentName, {"slab"}) then
+				table.insert(snapshot.slabs, obj)
+			elseif isMatch(obj.Name, {"cash", "money", "dollar", "coin"}) or isMatch(parentName, {"cash", "money", "dollar", "coin"}) then
+				table.insert(snapshot.cash, obj)
+			elseif isMatch(obj.Name, {"ball"}) or isMatch(parentName, {"ball"}) then
+				table.insert(snapshot.balls, obj)
+			elseif isMatch(obj.Name, {"potato"}) or isMatch(parentName, {"potato"}) then
+				table.insert(snapshot.potatoes, obj)
 			elseif obj:IsA("Seat") or obj:IsA("VehicleSeat") or isMatch(obj.Name, {"chair", "seat"}) or isMatch(parentName, {"chair", "seat"}) then
 				table.insert(snapshot.chairs, obj)
 			elseif isMatch(obj.Name, {"bomb", "defuse"}) or isMatch(parentName, {"bomb", "defuse"}) then
@@ -238,115 +494,368 @@ end
 
 -- ---------- Phase detection ----------
 
-local function detectPhase(snapshot, combined)
+local CHALLENGE_NAMES = {
+	jump = "JUMP TO AVOID DAMAGE",
+	laser = "DON'T TOUCH THE LASER",
+	lava = "DON'T DROWN IN THE LAVA",
+	abyss = "DON'T FALL INTO THE ABYSS",
+	generator = "FILL THE GENERATOR WITH FUEL",
+	slab = "RED SLABS WILL DISAPPEAR",
+	hide = "HIDE",
+	tiles = "TILES ARE DISAPPEARING",
+	bomb = "DEFUSE THE BOMBS",
+	cash = "COLLECT CASH",
+	above = "BE ABOVE ALL",
+	mask = "PICK UP THE GAS MASK",
+	ball = "CATCH THE BALL",
+	potato = "THE POTATO WILL EXPLODE",
+	plate = "STAND ON THE RIGHT COLOR",
+	chair = "SIT DOWN",
+	floor = "DON'T FALL",
+}
+
+local function detectPhase(snapshot, texts)
+	local combined = lower(table.concat(texts, " "))
+
 	local function has(keyword)
 		return string.find(combined, keyword, 1, true) ~= nil
 	end
 
-	if #snapshot.masks > 0 and (has("gas mask") or has("pick up") or has("mask")) then
-		return "mask"
+	-- The first UI label containing any of these keywords is the challenge
+	-- announcement - that's what we show in the GUI.
+	local function labelFor(keywords)
+		for _, t in ipairs(texts) do
+			local tl = lower(t)
+			for _, kw in ipairs(keywords) do
+				if string.find(tl, kw, 1, true) ~= nil then
+					return t
+				end
+			end
+		end
+		return nil
 	end
 
-	if #snapshot.chairs > 0 and (has("sit") or has("chair")) then
-		return "chair"
+	-- Order matters: check the most specific phrases first.
+	if has("fuel") or has("generator") then
+		return "generator", labelFor({"fuel", "generator"})
 	end
-
+	if has("laser") then
+		return "laser", labelFor({"laser"})
+	end
+	if has("lava") or has("drown") then
+		return "lava", labelFor({"lava", "drown"})
+	end
+	if has("abyss") then
+		return "abyss", labelFor({"abyss"})
+	end
+	if #snapshot.slabs > 0 and has("slab") then
+		return "slab", labelFor({"slab"})
+	end
+	if has("potato") then
+		return "potato", labelFor({"potato"})
+	end
+	if #snapshot.cash > 0 and (has("cash") or has("money") or has("dollar")) then
+		return "cash", labelFor({"cash", "money", "dollar"})
+	end
+	if #snapshot.balls > 0 and has("ball") then
+		return "ball", labelFor({"ball"})
+	end
+	if has("above all") or has("highest") then
+		return "above", labelFor({"above all", "highest"})
+	end
+	if has("hide") then
+		return "hide", labelFor({"hide"})
+	end
+	if has("jump") then
+		return "jump", labelFor({"jump"})
+	end
+	if #snapshot.masks > 0 and (has("gas mask") or has("mask") or has("pick up")) then
+		return "mask", labelFor({"gas mask", "mask", "pick up"})
+	end
 	if #snapshot.bombs > 0 and (has("bomb") or has("defuse")) then
-		return "bomb"
+		return "bomb", labelFor({"bomb", "defuse"})
 	end
-
+	if #snapshot.chairs > 0 and (has("sit") or has("chair")) then
+		return "chair", labelFor({"sit", "chair"})
+	end
+	if has("tile") or (has("disappear") and has("fall")) then
+		return "tiles", labelFor({"tile", "disappear", "fall"})
+	end
 	if #snapshot.plates > 0 and (has("stand") or has("plate") or has("color")) then
 		local entry = findColorInText(combined)
 		if entry ~= nil then
-			return "plate"
+			return "plate", labelFor({"stand", "plate", "color"})
+		end
+	end
+	if #snapshot.floors > 0 and (has("floor") or has("fall")) then
+		return "floor", labelFor({"floor", "fall"})
+	end
+
+	return "unknown", nil
+end
+
+-- ---------- Fly pad (client-created anchored platform) ----------
+
+local flyPad = nil
+
+local function clearFlyPad()
+	if flyPad ~= nil then
+		pcall(function() flyPad:Destroy() end)
+		flyPad = nil
+	end
+end
+
+local function flyUp()
+	local root = getRootPart()
+	if root == nil then
+		return "no root"
+	end
+
+	if flyPad == nil or flyPad.Parent == nil then
+		local ok, pad = pcall(function()
+			local p = Instance.new("Part")
+			p.Name = "L2LB_FlyPad"
+			p.Anchored = true
+			p.CanCollide = true
+			p.Transparency = 1
+			p.Size = Vector3.new(12, 1, 12)
+			p.Parent = Workspace
+			return p
+		end)
+		if not ok then
+			-- fallback: just keep teleporting up
+		else
+			flyPad = pad
 		end
 	end
 
-	if #snapshot.floors > 0 and (has("don't fall") or has("dont fall") or has("fall") or has("floor")) then
-		return "floor"
+	local target = root.Position + Vector3.new(0, 30, 0)
+	if flyPad ~= nil then
+		flyPad.Position = Vector3.new(target.X, target.Y - 3, target.Z)
+		flyPad.CFrame = CFrame.new(flyPad.Position)
 	end
-
-	return "unknown"
+	teleportTo(target)
+	return "flying above the hazard"
 end
 
 -- ---------- Phase handlers ----------
+
+local cycle = {
+	fuel = 1,
+	fuelT = 0,
+	bomb = 1,
+	bombT = 0,
+	cash = 1,
+	cashT = 0,
+	chair = 1,
+	chairT = 0,
+}
+
+local botState = {
+	holdingDefuse = false,
+}
+
+local function setDefuse(on)
+	if on and not botState.holdingDefuse then
+		VirtualUser:Button1Down()
+		botState.holdingDefuse = true
+	elseif not on and botState.holdingDefuse then
+		VirtualUser:Button1Up()
+		botState.holdingDefuse = false
+	end
+end
+
+local function handleJump()
+	local humanoid = getHumanoid()
+	if humanoid ~= nil then
+		humanoid.Jump = true
+	end
+	return "jumping to avoid damage"
+end
+
+local function handleGenerator(snapshot)
+	local fuel = snapshot.fuel
+	if #fuel == 0 then
+		return "no fuel found"
+	end
+	if cycle.fuel > #fuel then
+		cycle.fuel = 1
+	end
+	if os.clock() - cycle.fuelT >= 0.5 then
+		cycle.fuelT = os.clock()
+		cycle.fuel = cycle.fuel + 1
+		if cycle.fuel > #fuel then
+			cycle.fuel = 1
+		end
+	end
+	local item = fuel[cycle.fuel]
+	teleportTo(item.Position + Vector3.new(0, 3, 0))
+	local gens = snapshot.generators
+	if #gens > 0 and cycle.fuel % 3 == 0 then
+		teleportTo(gens[1].Position + Vector3.new(0, 3, 0))
+	end
+	return "fueling the generator"
+end
+
+local function handleSlab(snapshot)
+	local slabs = snapshot.slabs
+	if #slabs == 0 then
+		return "no slabs found"
+	end
+	local root = getRootPart()
+	local safe = nil
+	local safeD = math.huge
+	for _, s in ipairs(slabs) do
+		pcall(function() s.Anchored = true end)
+		local c = s.Color
+		local isRed = false
+		if c ~= nil then
+			isRed = c.R > 0.4 and c.R > c.G * 1.4 and c.R > c.B * 1.4
+		end
+		if not isRed then
+			local d = 0
+			if root ~= nil then
+				d = (root.Position - s.Position).Magnitude
+			end
+			if d < safeD then
+				safe = s
+				safeD = d
+			end
+		end
+	end
+	if safe ~= nil then
+		teleportTo(safe.Position + Vector3.new(0, 3, 0))
+		return "standing on a safe slab"
+	end
+	return "all slabs are red - anchoring"
+end
+
+local function handleBomb(snapshot)
+	local bombs = snapshot.bombs
+	if #bombs == 0 then
+		return "no bombs found"
+	end
+	setDefuse(true)
+	if cycle.bomb > #bombs then
+		cycle.bomb = 1
+	end
+	if os.clock() - cycle.bombT >= 0.6 then
+		cycle.bombT = os.clock()
+		cycle.bomb = cycle.bomb + 1
+		if cycle.bomb > #bombs then
+			cycle.bomb = 1
+		end
+	end
+	local item = bombs[cycle.bomb]
+	teleportTo(item.Position + Vector3.new(0, 2, 0))
+	return "defusing bomb " .. cycle.bomb .. "/" .. #bombs
+end
+
+local function handleCash(snapshot)
+	local cash = snapshot.cash
+	if #cash == 0 then
+		return "no cash found"
+	end
+	if cycle.cash > #cash then
+		cycle.cash = 1
+	end
+	if os.clock() - cycle.cashT >= 0.5 then
+		cycle.cashT = os.clock()
+		cycle.cash = cycle.cash + 1
+		if cycle.cash > #cash then
+			cycle.cash = 1
+		end
+	end
+	local item = cash[cycle.cash]
+	teleportTo(item.Position + Vector3.new(0, 3, 0))
+	return "collecting cash " .. cycle.cash .. "/" .. #cash
+end
+
+local function handleAbove()
+	local target = nil
+	local bestY = -math.huge
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer then
+			local char = player.Character
+			if char ~= nil then
+				local r = char:FindFirstChild("HumanoidRootPart")
+				if r ~= nil and r:IsA("BasePart") then
+					local y = r.Position.Y
+					if y > bestY then
+						bestY = y
+						target = r.Position
+					end
+				end
+			end
+		end
+	end
+	if target ~= nil then
+		teleportTo(target + Vector3.new(0, 5, 0))
+		return "above the highest player"
+	end
+	return flyUp()
+end
 
 local function handleMask(snapshot)
 	local mask = snapshot.masks[1]
 	if mask == nil then
 		return "no mask found"
 	end
-
 	teleportTo(mask.Position + Vector3.new(0, 3, 0))
-	return "walking onto the gas mask"
+	return "picking up the gas mask"
 end
 
-local function handleChair(snapshot)
-	local chair = snapshot.chairs[1]
-	if chair == nil then
-		return "no chair found"
+local function handleBall(snapshot)
+	local balls = snapshot.balls
+	if #balls == 0 then
+		return "no balls found"
 	end
-
-	teleportTo(chair.Position + Vector3.new(0, 3, 0))
-
-	local humanoid = getHumanoid()
-	if humanoid ~= nil then
-		humanoid.Sit = true
-	end
-
-	return "sitting on a chair"
-end
-
-local function floorTop(part)
-	return part.Position + Vector3.new(0, part.Size.Y / 2 + 2, 0)
-end
-
-local function findHighestFloorTop(floors)
-	local best = nil
-	local bestY = -math.huge
-	for _, part in ipairs(floors) do
-		local top = floorTop(part)
-		if top.Y > bestY then
-			best = top
-			bestY = top.Y
-		end
-	end
-	return best
-end
-
-local function handleFloor(snapshot)
-	local anchoredAny = false
-	for _, part in ipairs(snapshot.floors) do
-		if not part.Anchored then
-			part.Anchored = true
-			anchoredAny = true
-		end
-	end
-
 	local root = getRootPart()
-	if root ~= nil and root.Position.Y < 5 then
-		local safe = findHighestFloorTop(snapshot.floors)
-		if safe ~= nil then
-			teleportTo(safe)
-			return "rescued from the fall"
+	local best = nil
+	local bestD = math.huge
+	for _, b in ipairs(balls) do
+		local d = 0
+		if root ~= nil then
+			d = (root.Position - b.Position).Magnitude
+		end
+		if d < bestD then
+			best = b
+			bestD = d
 		end
 	end
-
-	if anchoredAny then
-		return "floor anchored"
+	if best ~= nil then
+		teleportTo(best.Position + Vector3.new(0, 3, 0))
 	end
-
-	return "floor watching"
+	return "chasing the ball"
 end
 
-local function handleBomb(snapshot)
-	local bomb = snapshot.bombs[1]
-	if bomb == nil then
-		return "no bomb found"
+local function handlePotato()
+	local root = getRootPart()
+	if root == nil then
+		return "no root"
 	end
-
-	teleportTo(bomb.Position + Vector3.new(0, 2, 0))
-	return "standing on the bomb, holding"
+	local target = nil
+	local bestD = math.huge
+	for _, player in ipairs(Players:GetPlayers()) do
+		if player ~= LocalPlayer then
+			local char = player.Character
+			if char ~= nil then
+				local r = char:FindFirstChild("HumanoidRootPart")
+				if r ~= nil and r:IsA("BasePart") then
+					local d = (root.Position - r.Position).Magnitude
+					if d < bestD then
+						target = r.Position
+						bestD = d
+					end
+				end
+			end
+		end
+	end
+	if target ~= nil then
+		teleportTo(target + Vector3.new(0, 3, 0))
+		return "next to the nearest player"
+	end
+	return "no other players found"
 end
 
 local function handlePlate(snapshot, combined)
@@ -354,26 +863,101 @@ local function handlePlate(snapshot, combined)
 	if entry == nil then
 		return "color not announced"
 	end
-
-	local plate = closestPlate(snapshot.plates, entry[2])
-	if plate == nil then
-		return "no plate matches " .. entry[1]
+	local wanted = entry[1]
+	local root = getRootPart()
+	local best = nil
+	local bestD = math.huge
+	for _, part in ipairs(snapshot.plates) do
+		local c = part.Color
+		if c ~= nil and classifyColor(c) == wanted then
+			local d = 0
+			if root ~= nil then
+				d = (root.Position - part.Position).Magnitude
+			end
+			if d < bestD then
+				best = part
+				bestD = d
+			end
+		end
 	end
-
-	teleportTo(plate.Position + Vector3.new(0, 3, 0))
-	return "standing on the " .. entry[1] .. " plate"
+	if best == nil then
+		return "no plate matches " .. wanted
+	end
+	teleportTo(best.Position + Vector3.new(0, 3, 0))
+	return "standing on the " .. wanted .. " plate"
 end
 
--- ---------- Bot creation ----------
+local function handleChair(snapshot)
+	local humanoid = getHumanoid()
+	if humanoid ~= nil and humanoid.Sit == true then
+		return "already sitting"
+	end
+	local chairs = snapshot.chairs
+	if #chairs == 0 then
+		return "no chairs found"
+	end
+
+	local now = os.clock()
+	if cycle.chairT ~= 0 and now - cycle.chairT < 1.0 then
+		-- We sat recently and got unseated: hold still briefly before the
+		-- next hop so we never teleport-spam between chairs.
+		return "waiting to switch chairs"
+	end
+	if cycle.chairT ~= 0 and now - cycle.chairT >= 1.0 then
+		cycle.chair = cycle.chair + 1
+	end
+	cycle.chairT = now
+
+	if cycle.chair > #chairs then
+		cycle.chair = 1
+	end
+	local chair = chairs[cycle.chair]
+	teleportTo(chair.Position + Vector3.new(0, 3, 0))
+	if humanoid ~= nil then
+		humanoid.Sit = true
+	end
+	return "sitting on chair " .. cycle.chair
+end
+
+local HANDLERS = {
+	jump = handleJump,
+	laser = flyUp,
+	lava = flyUp,
+	abyss = flyUp,
+	hide = flyUp,
+	tiles = flyUp,
+	floor = flyUp,
+	generator = handleGenerator,
+	slab = handleSlab,
+	bomb = handleBomb,
+	cash = handleCash,
+	above = handleAbove,
+	mask = handleMask,
+	ball = handleBall,
+	potato = handlePotato,
+	chair = handleChair,
+}
+
+local FLY_PHASES = {
+	laser = true,
+	lava = true,
+	abyss = true,
+	hide = true,
+	tiles = true,
+	floor = true,
+}
+
+-- ---------- Bot ----------
 
 local function createBot(config)
 	local connections = {}
 	local botConnection = nil
 
 	local botOn = config.enabled
-	local holdingDefuse = false
 	local lastMessage = ""
 	local lastTick = 0
+	local lastSend = 0
+	local lastPhaseName = ""
 
 	local function setBotState(on)
 		botOn = on
@@ -382,14 +966,10 @@ local function createBot(config)
 
 	local function botTick()
 		if not botOn then
-			if holdingDefuse then
-				VirtualUser:Button1Up()
-				holdingDefuse = false
-			end
+			setDefuse(false)
 			return
 		end
 
-		-- throttle: 0.25s between ticks
 		local now = os.clock()
 		if now - lastTick < 0.25 then
 			return
@@ -398,36 +978,55 @@ local function createBot(config)
 
 		local snapshot = scanWorkspace()
 		local texts = collectUIText()
+		local phase, matchedLabel = detectPhase(snapshot, texts)
 		local combined = lower(table.concat(texts, " "))
-		local phase = detectPhase(snapshot, combined)
 		local message = ""
 
-		if phase == "mask" then
-			message = handleMask(snapshot)
-		elseif phase == "chair" then
-			message = handleChair(snapshot)
-		elseif phase == "bomb" then
-			if not holdingDefuse then
-				VirtualUser:Button1Down()
-				holdingDefuse = true
+		if phase ~= lastPhaseName then
+			-- Leaving a phase: release buttons and clean up the fly pad.
+			if lastPhaseName == "bomb" then
+				setDefuse(false)
 			end
-			message = handleBomb(snapshot)
+			if FLY_PHASES[lastPhaseName] then
+				clearFlyPad()
+			end
+			if phase == "bomb" then cycle.bomb = 1 cycle.bombT = os.clock() end
+			if phase == "cash" then cycle.cash = 1 cycle.cashT = os.clock() end
+			if phase == "generator" then cycle.fuel = 1 cycle.fuelT = os.clock() end
+			if phase == "chair" then cycle.chair = 1 end
+			sendDebug(snapshot, texts, phase, "", "phase-change")
+		end
+		lastPhaseName = phase
+
+		if phase == "chair" then
+			message = handleChair(snapshot)
 		elseif phase == "plate" then
 			message = handlePlate(snapshot, combined)
-		elseif phase == "floor" then
-			message = handleFloor(snapshot)
+		elseif HANDLERS[phase] ~= nil then
+			message = HANDLERS[phase](snapshot)
 		else
-			message = "watching for a challenge..."
-			if holdingDefuse then
-				VirtualUser:Button1Up()
-				holdingDefuse = false
+			message = "watching for a challenge."
+			setDefuse(false)
+		end
+
+		-- GUI: challenge name (from the announcement label) or idle text.
+		local display = "watching for a challenge."
+		if phase ~= "unknown" then
+			display = matchedLabel
+			if display == nil or display == "" then
+				display = CHALLENGE_NAMES[phase] or phase
 			end
 		end
+		wallState.message = display
 
 		if message ~= lastMessage then
 			lastMessage = message
-			wallState.message = message
 			reportStatus("Bot: " .. phase .. " - " .. message)
+		end
+
+		if now - lastSend >= 10 then
+			lastSend = now
+			sendDebug(snapshot, texts, phase, message, "periodic")
 		end
 	end
 
@@ -438,6 +1037,7 @@ local function createBot(config)
 			return
 		end
 		setBotState(true)
+		wallState.message = "watching for a challenge."
 		reportStatus("Bot enabled")
 	end
 
@@ -446,10 +1046,9 @@ local function createBot(config)
 			return
 		end
 		setBotState(false)
-		if holdingDefuse then
-			VirtualUser:Button1Up()
-			holdingDefuse = false
-		end
+		setDefuse(false)
+		clearFlyPad()
+		wallState.message = "Bot is OFF"
 		reportStatus("Bot disabled")
 	end
 
@@ -471,7 +1070,10 @@ local function createBot(config)
 		local snapshot = scanWorkspace()
 		local texts = collectUIText()
 		print("Objects found:")
-		print("masks:", #snapshot.masks, "chairs:", #snapshot.chairs, "bombs:", #snapshot.bombs, "plates:", #snapshot.plates, "floors:", #snapshot.floors)
+		print("masks:", #snapshot.masks, "chairs:", #snapshot.chairs, "bombs:", #snapshot.bombs,
+			"plates:", #snapshot.plates, "floors:", #snapshot.floors)
+		print("fuel:", #snapshot.fuel, "slabs:", #snapshot.slabs, "cash:", #snapshot.cash,
+			"balls:", #snapshot.balls, "potatoes:", #snapshot.potatoes, "generators:", #snapshot.generators)
 
 		local function dumpList(kind, list)
 			for _, part in ipairs(list) do
@@ -487,6 +1089,12 @@ local function createBot(config)
 		dumpList("bomb", snapshot.bombs)
 		dumpList("plate", snapshot.plates)
 		dumpList("floor", snapshot.floors)
+		dumpList("fuel", snapshot.fuel)
+		dumpList("slab", snapshot.slabs)
+		dumpList("cash", snapshot.cash)
+		dumpList("ball", snapshot.balls)
+		dumpList("potato", snapshot.potatoes)
+		dumpList("generator", snapshot.generators)
 
 		print("UI texts (" .. #texts .. "):")
 		for _, t in ipairs(texts) do
@@ -503,13 +1111,13 @@ local function createBot(config)
 				local probeAfter = root.Position
 				local dist = (before - probeAfter).Magnitude
 				print("Teleport probe: moved", string.format("%.2f", dist), "studs (works if > 0.5)")
-				-- restore position
 				root.CFrame = CFrame.new(before)
 			end)
 		end
 
 		print("=== Scan end ===")
-		reportStatus("Scan complete - see executor console")
+		sendDebug(snapshot, texts, lastPhaseName, "", "scan")
+		reportStatus("Scan complete - posted to debug server")
 	end
 
 	local function teardown()
@@ -519,6 +1127,8 @@ local function createBot(config)
 		end
 
 		disable()
+		setDefuse(false)
+		clearFlyPad()
 
 		for _, connection in ipairs(connections) do
 			connection:Disconnect()
@@ -618,10 +1228,11 @@ local function createStatusPanel()
 	titleBar.Parent = frame
 
 	local statusLabel = Instance.new("TextLabel")
+	statusLabel.Name = "StatusLabel"
 	statusLabel.Size = UDim2.new(1, -20, 0, 56)
 	statusLabel.Position = UDim2.fromOffset(10, 36)
 	statusLabel.BackgroundTransparency = 1
-	statusLabel.Text = "Starting..."
+	statusLabel.Text = wallState.message
 	statusLabel.TextColor3 = Color3.fromRGB(200, 205, 215)
 	statusLabel.Font = Enum.Font.SourceSans
 	statusLabel.TextSize = 13
@@ -679,13 +1290,7 @@ local function createStatusPanel()
 	removeCorner.Parent = removeButton
 
 	local panelConnections = {}
-	local lastMessage = ""
 	local lastRefresh = 0
-
-	local function setStatus(text)
-		lastMessage = text
-		statusLabel.Text = text
-	end
 
 	local function destroy()
 		for _, connection in ipairs(panelConnections) do
@@ -759,14 +1364,10 @@ local function createStatusPanel()
 			botButton.BackgroundColor3 = Color3.fromRGB(100, 110, 120)
 		end
 
-		local msg = wallState.message
-		if msg ~= "" then
-			statusLabel.Text = msg
-		end
+		statusLabel.Text = wallState.message
 	end))
 
 	return {
-		setStatus = setStatus,
 		destroy = destroy,
 	}
 end
@@ -785,15 +1386,15 @@ end
 
 local config = resolveConfig()
 
+local api = createBot(config)
+boundAPI = api
+
 local statusPanel = createStatusPanel()
 if statusPanel ~= nil then
 	statusPanelAPI = statusPanel
 else
 	warn("[LastToLeaveBox] No PlayerGui - panel skipped.")
 end
-
-local api = createBot(config)
-boundAPI = api
 
 local ok, regErr = pcall(function()
 	getEnvironment().lastToLeaveBox = api
@@ -807,7 +1408,8 @@ if config.enabled then
 	stateText = "ON"
 end
 
-reportStatus("Loaded on place " .. tostring(game.PlaceId) .. " - bot " .. stateText .. ". Press Scan to inspect the game.")
+reportStatus("Loaded on place " .. tostring(game.PlaceId) .. " - bot " .. stateText ..
+	". Press Scan to inspect + post to the debug server.")
 
 if config.enabled then
 	local ok, err = pcall(api.enable)
