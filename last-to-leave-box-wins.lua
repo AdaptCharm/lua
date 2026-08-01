@@ -15,6 +15,11 @@ type WallAPI = {
 	destroy: () -> (),
 }
 
+type StatusPanel = {
+	setStatus: (text: string) -> (),
+	destroy: () -> (),
+}
+
 type Environment = {
 	config: Config?,
 	lastToLeaveBox: WallAPI?,
@@ -47,6 +52,25 @@ local SEGMENT_LENGTH = 5
 local WALL_THICKNESS = 2
 local WALL_COLOR = Color3.fromRGB(255, 90, 90)
 local TOGGLE_KEY = Enum.KeyCode.RightShift
+local WALL_MODEL_NAME = "LastToLeaveBoxWall"
+local VELOCITY_NAME = "WallPull"
+
+-- Shared state between the wall and the status panel.
+local wallState = {
+	active = false,
+	partCount = 0,
+}
+
+local statusPanelAPI: StatusPanel? = nil
+local boundAPI: WallAPI? = nil
+
+local function reportStatus(text: string)
+	if statusPanelAPI ~= nil then
+		statusPanelAPI.setStatus(text)
+	end
+
+	warn("[LastToLeaveBox]", text)
+end
 
 local function resolveNumber(value: any, fallback: number): number
 	if typeof(value) ~= "number" then
@@ -140,13 +164,21 @@ local function newPrimaryPart(): BasePart
 	return primaryPart
 end
 
-local function createWall(config: Config): WallAPI
-	local ringModel = Instance.new("Model")
-	ringModel.Name = "LastToLeaveBoxWall"
-	ringModel.Parent = Workspace
+-- The wall model is looked up by name instead of holding a reference.
+-- If the server rejects a client-created model, it is destroyed, and a
+-- stale reference would throw on every frame. A fresh lookup simply
+-- returns nil and we treat that as "the wall is gone".
+local function findWallModel(): Model?
+	local model = Workspace:FindFirstChild(WALL_MODEL_NAME)
+	if model ~= nil and model:IsA("Model") then
+		return model :: Model
+	end
 
+	return nil
+end
+
+local function createWall(config: Config): WallAPI
 	local connections: { RBXScriptConnection } = {}
-	local velocities: { [Player]: BodyVelocity? } = {}
 
 	local buildConnection: RBXScriptConnection? = nil
 	local rotationConnection: RBXScriptConnection? = nil
@@ -154,36 +186,34 @@ local function createWall(config: Config): WallAPI
 	local active = false
 	local destroyed = false
 	local angle = 0
+	local forceRejectCount = 0
+	local reportedForceRejection = false
 
-	local function clearVelocities()
-		for _, velocity in velocities do
-			if velocity ~= nil then
-				velocity:Destroy()
-			end
-		end
-
-		table.clear(velocities)
+	local function setWallState(nowActive: boolean, partCount: number)
+		wallState.active = nowActive
+		wallState.partCount = partCount
 	end
 
-	local function trackVelocitiesFor(player: Player)
-		if player == LocalPlayer then
+	local function handleWallRemoved()
+		if not active then
 			return
 		end
 
-		table.insert(connections, player.CharacterRemoving:Connect(function()
-			local velocity = velocities[player]
-			if velocity ~= nil then
-				velocity:Destroy()
-				velocities[player] = nil
-			end
-		end))
-	end
+		active = false
+		setWallState(false, 0)
 
-	for _, player in Players:GetPlayers() do
-		trackVelocitiesFor(player)
-	end
+		if rotationConnection ~= nil then
+			rotationConnection:Disconnect()
+			rotationConnection = nil
+		end
 
-	table.insert(connections, Players.PlayerAdded:Connect(trackVelocitiesFor))
+		if buildConnection ~= nil then
+			buildConnection:Disconnect()
+			buildConnection = nil
+		end
+
+		reportStatus("The wall was removed by the game — this server rejects client-created parts.")
+	end
 
 	local function applyAttraction()
 		if config.attractionStrength <= 0 then
@@ -211,21 +241,35 @@ local function createWall(config: Config): WallAPI
 			local offset = rootPart.Position - center
 			local distance = offset.Magnitude
 			if distance < 1 or distance > pullRange then
-				local velocity = velocities[player]
+				local velocity = rootPart:FindFirstChild(VELOCITY_NAME)
 				if velocity ~= nil then
 					velocity:Destroy()
-					velocities[player] = nil
 				end
 
 				continue
 			end
 
-			local velocity = velocities[player]
+			-- The force is also looked up fresh: if the server keeps
+			-- destroying it, we stop creating it and say so.
+			local velocity = rootPart:FindFirstChild(VELOCITY_NAME) :: BodyVelocity?
 			if velocity == nil then
+				forceRejectCount += 1
+
+				if forceRejectCount > 10 then
+					if not reportedForceRejection then
+						reportedForceRejection = true
+						reportStatus("The pull force keeps getting rejected — the wall is not affecting other players.")
+					end
+
+					continue
+				end
+
 				velocity = Instance.new("BodyVelocity")
+				velocity.Name = VELOCITY_NAME
 				velocity.MaxForce = Vector3.new(config.attractionStrength, 0, config.attractionStrength)
 				velocity.Parent = rootPart
-				velocities[player] = velocity
+			else
+				forceRejectCount = 0
 			end
 
 			-- Aim at the nearest point on the ring so they slam into the wall.
@@ -236,8 +280,14 @@ local function createWall(config: Config): WallAPI
 	end
 
 	local function rotateAndAttract(dt: number)
+		local model = findWallModel()
+		if model == nil then
+			handleWallRemoved()
+			return
+		end
+
 		angle += math.rad(config.rotationSpeed) * dt
-		ringModel:PivotTo(CFrame.new(currentCenter()) * CFrame.Angles(0, angle, 0))
+		model:PivotTo(CFrame.new(currentCenter()) * CFrame.Angles(0, angle, 0))
 		applyAttraction()
 	end
 
@@ -247,21 +297,40 @@ local function createWall(config: Config): WallAPI
 		end
 
 		angle = 0
-		ringModel:ClearAllChildren()
+		forceRejectCount = 0
+		reportedForceRejection = false
+
+		local previous = findWallModel()
+		if previous ~= nil then
+			previous:Destroy()
+		end
+
+		local model = Instance.new("Model")
+		model.Name = WALL_MODEL_NAME
 
 		local primaryPart = newPrimaryPart()
-		primaryPart.Parent = ringModel
-		ringModel.PrimaryPart = primaryPart
+		primaryPart.Parent = model
+		model.PrimaryPart = primaryPart
+		model.Parent = Workspace
 
 		local totalParts = ringPartCount(config.radius)
 		local created = 0
 
 		local build = RunService.Heartbeat:Connect(function()
+			-- A rejected model disappears from Workspace; checking by name
+			-- avoids touching a destroyed instance.
+			if Workspace:FindFirstChild(WALL_MODEL_NAME) ~= model then
+				build:Disconnect()
+				buildConnection = nil
+				reportStatus("The wall was rejected while building — this server filters client-created parts.")
+				return
+			end
+
 			local batchEnd = math.min(created + config.maxPartsPerFrame, totalParts)
 
 			while created < batchEnd do
 				local part = buildRingPart(config.radius, config.height, created, totalParts)
-				part.Parent = ringModel
+				part.Parent = model
 				created += 1
 			end
 
@@ -269,9 +338,20 @@ local function createWall(config: Config): WallAPI
 				build:Disconnect()
 				buildConnection = nil
 
-				ringModel:PivotTo(CFrame.new(currentCenter()))
+				model:PivotTo(CFrame.new(currentCenter()))
 				rotationConnection = RunService.Heartbeat:Connect(rotateAndAttract)
 				active = true
+				setWallState(true, created)
+				reportStatus(string.format("Wall active (%d parts). RightShift toggles.", created))
+
+				-- Some servers delete the wall a moment after we build it;
+				-- verify it survived so we can report that instead of
+				-- silently spinning a dead wall.
+				task.delay(2, function()
+					if active and findWallModel() == nil then
+						handleWallRemoved()
+					end
+				end)
 			end
 		end)
 		buildConnection = build
@@ -293,10 +373,13 @@ local function createWall(config: Config): WallAPI
 		end
 
 		active = false
+		setWallState(false, 0)
 
 		if config.autoClearCacheOnDisable then
-			ringModel:ClearAllChildren()
-			clearVelocities()
+			local model = findWallModel()
+			if model ~= nil then
+				model:Destroy()
+			end
 		end
 	end
 
@@ -308,11 +391,17 @@ local function createWall(config: Config): WallAPI
 		stop()
 		destroyed = true
 
-		ringModel:Destroy()
-		clearVelocities()
+		local model = findWallModel()
+		if model ~= nil then
+			model:Destroy()
+		end
 
 		for _, connection in connections do
 			connection:Disconnect()
+		end
+
+		if statusPanelAPI ~= nil then
+			statusPanelAPI.destroy()
 		end
 	end
 
@@ -362,6 +451,170 @@ local function createWall(config: Config): WallAPI
 	}
 end
 
+-- A small status panel in the corner of the screen. It is deliberately
+-- minimal: its job is to show what the script is doing and why it might
+-- not be working, not to clone a full script hub.
+local function createStatusPanel(): StatusPanel
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+	local existing = playerGui:FindFirstChild("LastToLeaveBoxPanel")
+	if existing ~= nil then
+		existing:Destroy()
+	end
+
+	local screenGui = Instance.new("ScreenGui")
+	screenGui.Name = "LastToLeaveBoxPanel"
+	screenGui.ResetOnSpawn = false
+	screenGui.Parent = playerGui
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Panel"
+	frame.AnchorPoint = Vector2.new(1, 1)
+	frame.Size = UDim2.fromOffset(280, 150)
+	frame.Position = UDim2.new(1, -12, 1, -12)
+	frame.BackgroundColor3 = Color3.fromRGB(24, 26, 34)
+	frame.BorderSizePixel = 0
+	frame.Parent = screenGui
+
+	local frameCorner = Instance.new("UICorner")
+	frameCorner.CornerRadius = UDim.new(0, 10)
+	frameCorner.Parent = frame
+
+	local frameStroke = Instance.new("UIStroke")
+	frameStroke.Color = Color3.fromRGB(70, 80, 100)
+	frameStroke.Thickness = 1
+	frameStroke.Parent = frame
+
+	local titleBar = Instance.new("TextLabel")
+	titleBar.Size = UDim2.new(1, 0, 0, 30)
+	titleBar.BackgroundColor3 = Color3.fromRGB(34, 37, 48)
+	titleBar.Text = "Last to Leave Box"
+	titleBar.TextColor3 = Color3.fromRGB(235, 235, 235)
+	titleBar.Font = Enum.Font.SourceSansBold
+	titleBar.TextSize = 16
+	titleBar.Parent = frame
+
+	local statusLabel = Instance.new("TextLabel")
+	statusLabel.Size = UDim2.new(1, -20, 0, 56)
+	statusLabel.Position = UDim2.fromOffset(10, 36)
+	statusLabel.BackgroundTransparency = 1
+	statusLabel.Text = "Starting..."
+	statusLabel.TextColor3 = Color3.fromRGB(200, 205, 215)
+	statusLabel.Font = Enum.Font.SourceSans
+	statusLabel.TextSize = 13
+	statusLabel.TextXAlignment = Enum.TextXAlignment.Left
+	statusLabel.TextYAlignment = Enum.TextYAlignment.Top
+	statusLabel.TextWrapped = true
+	statusLabel.Parent = frame
+
+	local toggleButton = Instance.new("TextButton")
+	toggleButton.Size = UDim2.fromOffset(120, 30)
+	toggleButton.Position = UDim2.fromOffset(10, 104)
+	toggleButton.BackgroundColor3 = Color3.fromRGB(45, 120, 255)
+	toggleButton.Text = "Enable"
+	toggleButton.TextColor3 = Color3.new(1, 1, 1)
+	toggleButton.Font = Enum.Font.SourceSansBold
+	toggleButton.TextSize = 14
+	toggleButton.BorderSizePixel = 0
+	toggleButton.Parent = frame
+
+	local toggleCorner = Instance.new("UICorner")
+	toggleCorner.CornerRadius = UDim.new(0, 6)
+	toggleCorner.Parent = toggleButton
+
+	local removeButton = Instance.new("TextButton")
+	removeButton.Size = UDim2.fromOffset(120, 30)
+	removeButton.Position = UDim2.fromOffset(150, 104)
+	removeButton.BackgroundColor3 = Color3.fromRGB(190, 60, 60)
+	removeButton.Text = "Remove"
+	removeButton.TextColor3 = Color3.new(1, 1, 1)
+	removeButton.Font = Enum.Font.SourceSansBold
+	removeButton.TextSize = 14
+	removeButton.BorderSizePixel = 0
+	removeButton.Parent = frame
+
+	local removeCorner = Instance.new("UICorner")
+	removeCorner.CornerRadius = UDim.new(0, 6)
+	removeCorner.Parent = removeButton
+
+	local panelConnections: { RBXScriptConnection } = {}
+	local lastMessage = ""
+	local lastRefresh = 0
+
+	local function setStatus(text: string)
+		lastMessage = text
+		statusLabel.Text = text
+	end
+
+	local function destroy()
+		for _, connection in panelConnections do
+			connection:Disconnect()
+		end
+
+		screenGui:Destroy()
+	end
+
+	-- Drag the panel by its title bar.
+	local dragging = false
+	local dragStart = Vector2.zero
+	local frameStart = frame.Position
+
+	table.insert(panelConnections, titleBar.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			frameStart = frame.Position
+		end
+	end))
+
+	table.insert(panelConnections, UserInputService.InputChanged:Connect(function(input)
+		if not dragging then
+			return
+		end
+
+		if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+			local delta = input.Position - dragStart
+			frame.Position = UDim2.fromOffset(frameStart.X.Offset + delta.X, frameStart.Y.Offset + delta.Y)
+		end
+	end))
+
+	table.insert(panelConnections, UserInputService.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end))
+
+	toggleButton.MouseButton1Click:Connect(function()
+		if boundAPI ~= nil then
+			boundAPI.toggle()
+		end
+	end)
+
+	removeButton.MouseButton1Click:Connect(function()
+		if boundAPI ~= nil then
+			boundAPI.destroy()
+		end
+	end)
+
+	-- Refresh the state line a few times per second.
+	table.insert(panelConnections, RunService.Heartbeat:Connect(function()
+		local now = os.clock()
+		if now - lastRefresh < 0.25 then
+			return
+		end
+		lastRefresh = now
+
+		local stateText = if wallState.active then string.format("Active — %d parts", wallState.partCount) else "Disabled"
+		statusLabel.Text = stateText .. "\n" .. lastMessage
+		toggleButton.Text = if wallState.active then "Disable" else "Enable"
+	end))
+
+	return {
+		setStatus = setStatus,
+		destroy = destroy,
+	}
+end
+
 -- Re-running the script replaces the previous instance instead of
 -- stacking a second one on top.
 local previousAPI = getgenv().lastToLeaveBox
@@ -371,15 +624,27 @@ end
 
 -- Clean up walls left behind by older versions that had no API.
 for _, model in Workspace:GetChildren() do
-	if model:IsA("Model") and model.Name == "LastToLeaveBoxWall" then
+	if model:IsA("Model") and model.Name == WALL_MODEL_NAME then
 		model:Destroy()
 	end
 end
 
 local config = resolveConfig()
+
+local statusPanel = createStatusPanel()
+statusPanelAPI = statusPanel
+
 local wallAPI = createWall(config)
+boundAPI = wallAPI
 getgenv().lastToLeaveBox = wallAPI
 
+reportStatus(string.format("Loaded on place %d — config.enabled = %s", game.PlaceId, tostring(config.enabled)))
+
 if config.enabled then
-	wallAPI.enable()
+	local ok, err = pcall(wallAPI.enable)
+	if not ok then
+		reportStatus("Failed to start the wall: " .. tostring(err))
+	end
+else
+	reportStatus("Disabled by config — press RightShift or the Enable button to start.")
 end
