@@ -343,6 +343,7 @@ local function buildPayload(snapshot, texts, phase, message, reason)
 	payload.balls = catTable(snapshot.balls)
 	payload.potatoes = catTable(snapshot.potatoes)
 	payload.generators = catTable(snapshot.generators)
+	payload.buttons = catTable(snapshot.buttons)
 	return payload
 end
 
@@ -475,94 +476,6 @@ local function sendDebug(snapshot, texts, phase, message, reason)
 	end
 end
 
--- ---------- Color helpers ----------
-
-local COLOR_MAP = {
-	{ "red", Color3.fromRGB(255, 0, 0) },
-	{ "blue", Color3.fromRGB(0, 0, 255) },
-	{ "green", Color3.fromRGB(0, 255, 0) },
-	{ "yellow", Color3.fromRGB(255, 255, 0) },
-	{ "orange", Color3.fromRGB(255, 165, 0) },
-	{ "purple", Color3.fromRGB(128, 0, 255) },
-	{ "pink", Color3.fromRGB(255, 105, 180) },
-	{ "white", Color3.fromRGB(255, 255, 255) },
-	{ "black", Color3.fromRGB(0, 0, 0) },
-	{ "cyan", Color3.fromRGB(0, 255, 255) },
-	{ "magenta", Color3.fromRGB(255, 0, 255) },
-	{ "brown", Color3.fromRGB(165, 42, 42) },
-	{ "lime", Color3.fromRGB(50, 255, 50) },
-}
-
-local function findColorInText(text)
-	local t = lower(text)
-	for _, entry in ipairs(COLOR_MAP) do
-		if string.find(t, entry[1], 1, true) ~= nil then
-			return entry
-		end
-	end
-	return nil
-end
-
--- Best-matching color NAME for a plate's RGB, using hue so off-shade plate
--- colors ("red" plates that are actually dark red / orange-red) still match
--- "red". RGB-distance matching fails here (a dark red is closer to brown).
-local function classifyColor(c)
-	local max = math.max(c.R, c.G, c.B)
-	local min = math.min(c.R, c.G, c.B)
-	local d = max - min
-	local value = max
-
-	-- No dominant hue: white or black.
-	if d < 0.15 then
-		if value > 0.5 then
-			return "white"
-		end
-		return "black"
-	end
-
-	-- Hue in degrees 0..360.
-	local h = 0
-	if max == c.R then
-		h = ((c.G - c.B) / d) % 6
-	elseif max == c.G then
-		h = (c.B - c.R) / d + 2
-	else
-		h = (c.R - c.G) / d + 4
-	end
-	h = h * 60
-
-	local hueNames = {
-		{ "red", 0 },
-		{ "orange", 30 },
-		{ "yellow", 60 },
-		{ "lime", 90 },
-		{ "green", 120 },
-		{ "cyan", 180 },
-		{ "blue", 240 },
-		{ "purple", 275 },
-		{ "magenta", 300 },
-		{ "pink", 330 },
-		{ "red", 360 },
-	}
-	local best = "red"
-	local bestD = math.huge
-	for _, e in ipairs(hueNames) do
-		local dd = math.abs(h - e[2])
-		if dd > 180 then
-			dd = 360 - dd
-		end
-		if dd < bestD then
-			best = e[1]
-			bestD = dd
-		end
-	end
-	-- Dark reds/oranges read as brown.
-	if (best == "red" or best == "orange") and value < 0.45 then
-		return "brown"
-	end
-	return best
-end
-
 -- ---------- Object scanning ----------
 
 local function isMatch(name, keywords)
@@ -674,6 +587,7 @@ local function scanWorkspace()
 		balls = {},
 		potatoes = {},
 		generators = {},
+		buttons = {},
 		workspaceChildren = {},
 	}
 
@@ -712,6 +626,12 @@ local function scanWorkspace()
 				table.insert(snapshot.plates, obj)
 			elseif isMatch(obj.Name, {"floor", "platform", "ground"}) or isMatch(parentName, {"floor", "platform", "ground"}) then
 				table.insert(snapshot.floors, obj)
+			elseif obj:FindFirstChildOfClass("ClickDetector", true) ~= nil or obj:FindFirstChildOfClass("ProximityPrompt", true) ~= nil or isMatch(obj.Name, {"button", "press", "switch", "lever"}) or isMatch(parentName, {"button", "press", "switch", "lever"}) then
+				-- Buttons go last so masks/plates/etc. with click prompts
+				-- still land in their own buckets. Cap keeps the payload small.
+				if #snapshot.buttons < 20 then
+					table.insert(snapshot.buttons, obj)
+				end
 			end
 		end
 	end
@@ -739,6 +659,7 @@ local CHALLENGE_NAMES = {
 	plate = "STAND ON THE RIGHT COLOR",
 	chair = "SIT DOWN",
 	floor = "DON'T FALL",
+	button = "PRESS THE BUTTON",
 }
 
 local function detectPhase(snapshot, texts)
@@ -808,6 +729,11 @@ local function detectPhase(snapshot, texts)
 	if labelHasAll("fuel", "generator") then
 		return "generator", labelFor({"fuel", "generator"})
 	end
+	-- "🔳 Press Button 🔳" / "Press the button quickly after: X seconds!" /
+	-- " PRESS BUTTON !" - a reaction-time round; we find and click the button.
+	if has("press button") or has("press the button") then
+		return "button", labelFor({"press button", "press the button"})
+	end
 	if hazardMatch("laser", {"touch", "avoid", "don't", "dont", "survive", "beam"}) then
 		return "laser", labelFor({"laser"})
 	end
@@ -817,8 +743,11 @@ local function detectPhase(snapshot, texts)
 	if hazardMatch("abyss", {"fall", "don't", "dont", "into", "avoid"}) then
 		return "abyss", labelFor({"abyss"})
 	end
-	if #snapshot.slabs > 0 and has("slab") then
-		return "slab", labelFor({"slab"})
+	-- The slabs round announces "The slabs shown in red will disappear" but
+	-- the slab parts have unrecognized names, so match on text alone and fly
+	-- up (same solution as the abyss round).
+	if labelHasAll("slab", "disappear") or labelHasAll("slab", "shown") then
+		return "slab", labelFor({"slab", "disappear"})
 	end
 	if labelHasAll("potato", "explode") or labelHasAll("potato", "pass") then
 		return "potato", labelFor({"potato"})
@@ -850,11 +779,11 @@ local function detectPhase(snapshot, texts)
 	if hazardMatch("tile", {"disappear", "fall", "don't", "dont"}) or (has("disappear") and has("fall")) then
 		return "tiles", labelFor({"tile", "disappear", "fall"})
 	end
-	if #snapshot.plates > 0 and (has("stand") or has("plate") or has("color")) then
-		local entry = findColorInText(combined)
-		if entry ~= nil then
-			return "plate", labelFor({"stand", "plate", "color"})
-		end
+	-- "Stand on the plate with the desired color" (title "Colored tiles").
+	-- The plate parts are not name-matchable either, so detect from the
+	-- announcement text and fly up (same solution as the abyss round).
+	if labelHasAll("stand", "plate") or has("colored") then
+		return "plate", labelFor({"stand", "plate", "colored"})
 	end
 	if #snapshot.floors > 0 and (has("floor") or has("fall")) then
 		return "floor", labelFor({"floor", "fall"})
@@ -972,39 +901,6 @@ local function handleGenerator(snapshot)
 		teleportTo(gens[1].Position + Vector3.new(0, 3, 0))
 	end
 	return "fueling the generator"
-end
-
-local function handleSlab(snapshot)
-	local slabs = snapshot.slabs
-	if #slabs == 0 then
-		return "no slabs found"
-	end
-	local root = getRootPart()
-	local safe = nil
-	local safeD = math.huge
-	for _, s in ipairs(slabs) do
-		pcall(function() s.Anchored = true end)
-		local c = s.Color
-		local isRed = false
-		if c ~= nil then
-			isRed = c.R > 0.4 and c.R > c.G * 1.4 and c.R > c.B * 1.4
-		end
-		if not isRed then
-			local d = 0
-			if root ~= nil then
-				d = (root.Position - s.Position).Magnitude
-			end
-			if d < safeD then
-				safe = s
-				safeD = d
-			end
-		end
-	end
-	if safe ~= nil then
-		teleportTo(safe.Position + Vector3.new(0, 3, 0))
-		return "standing on a safe slab"
-	end
-	return "all slabs are red - anchoring"
 end
 
 local function handleBomb(snapshot)
@@ -1135,33 +1031,48 @@ local function handlePotato()
 	return "no other players found"
 end
 
-local function handlePlate(snapshot, combined)
-	local entry = findColorInText(combined)
-	if entry == nil then
-		return "color not announced"
-	end
-	local wanted = entry[1]
-	local root = getRootPart()
-	local best = nil
-	local bestD = math.huge
-	for _, part in ipairs(snapshot.plates) do
-		local c = part.Color
-		if c ~= nil and classifyColor(c) == wanted then
+local function handleButton(snapshot)
+	local buttons = snapshot.buttons
+	if #buttons > 0 then
+		local root = getRootPart()
+		local best = nil
+		local bestD = math.huge
+		for _, b in ipairs(buttons) do
 			local d = 0
 			if root ~= nil then
-				d = (root.Position - part.Position).Magnitude
+				d = (root.Position - b.Position).Magnitude
 			end
 			if d < bestD then
-				best = part
+				best = b
 				bestD = d
 			end
 		end
+		if best ~= nil then
+			teleportTo(best.Position + Vector3.new(0, 3, 0))
+			-- Try to actually press it: ClickDetector and ProximityPrompt
+			-- buttons can both be triggered client-side.
+			local pressed = false
+			pcall(function()
+				for _, child in ipairs(best:GetDescendants()) do
+					if child:IsA("ClickDetector") then
+						child:MouseClick(LocalPlayer)
+						pressed = true
+					elseif child:IsA("ProximityPrompt") then
+						if ProximityPromptService ~= nil then
+							ProximityPromptService:PromptButtonHoldBegan(child, LocalPlayer)
+							pressed = true
+						end
+					end
+				end
+			end)
+			if pressed then
+				return "pressing the button"
+			end
+			return "standing on the button pad"
+		end
 	end
-	if best == nil then
-		return "no plate matches " .. wanted
-	end
-	teleportTo(best.Position + Vector3.new(0, 3, 0))
-	return "standing on the " .. wanted .. " plate"
+	-- No button found: hover out of reach (also dodges drone grabs).
+	return flyUp()
 end
 
 local function handleChair(snapshot)
@@ -1205,7 +1116,9 @@ local HANDLERS = {
 	tiles = flyUp,
 	floor = flyUp,
 	generator = handleGenerator,
-	slab = handleSlab,
+	slab = flyUp,
+	plate = flyUp,
+	button = handleButton,
 	bomb = handleBomb,
 	cash = handleCash,
 	above = handleAbove,
@@ -1222,6 +1135,9 @@ local FLY_PHASES = {
 	hide = true,
 	tiles = true,
 	floor = true,
+	slab = true,
+	plate = true,
+	button = true,
 }
 
 -- ---------- Bot ----------
@@ -1255,7 +1171,6 @@ local function createBot(config)
 		local snapshot = scanWorkspace()
 		local texts = collectUIText()
 		local phase, matchedLabel = detectPhase(snapshot, texts)
-		local combined = lower(table.concat(texts, " "))
 		local message = ""
 
 		if phase ~= lastPhaseName then
@@ -1276,8 +1191,6 @@ local function createBot(config)
 
 		if phase == "chair" then
 			message = handleChair(snapshot)
-		elseif phase == "plate" then
-			message = handlePlate(snapshot, combined)
 		elseif HANDLERS[phase] ~= nil then
 			message = HANDLERS[phase](snapshot)
 		else
@@ -1349,7 +1262,8 @@ local function createBot(config)
 		print("masks:", #snapshot.masks, "chairs:", #snapshot.chairs, "bombs:", #snapshot.bombs,
 			"plates:", #snapshot.plates, "floors:", #snapshot.floors)
 		print("fuel:", #snapshot.fuel, "slabs:", #snapshot.slabs, "cash:", #snapshot.cash,
-			"balls:", #snapshot.balls, "potatoes:", #snapshot.potatoes, "generators:", #snapshot.generators)
+			"balls:", #snapshot.balls, "potatoes:", #snapshot.potatoes, "generators:", #snapshot.generators,
+			"buttons:", #snapshot.buttons)
 
 		local function dumpList(kind, list)
 			for _, part in ipairs(list) do
@@ -1371,6 +1285,7 @@ local function createBot(config)
 		dumpList("ball", snapshot.balls)
 		dumpList("potato", snapshot.potatoes)
 		dumpList("generator", snapshot.generators)
+		dumpList("button", snapshot.buttons)
 
 		print("UI texts (" .. #texts .. "):")
 		for _, t in ipairs(texts) do
@@ -1451,6 +1366,10 @@ local function createBot(config)
 	-- Character no-collide: let us walk through parts the bot teleports us to.
 	-- Only while the bot is ON - with the bot off it would make the character
 	-- fall through the floor (CanCollide=false on the root part = noclip).
+	-- During the jump round we RESTORE collision: a noclip character is never
+	-- grounded, so humanoid.Jump silently does nothing (that's why the jump
+	-- round "didn't work"). Keep the character collidable so it lands and
+	-- can re-jump every tick.
 	table.insert(connections, RunService.Stepped:Connect(function()
 		if not botOn then
 			return
@@ -1461,9 +1380,10 @@ local function createBot(config)
 			return
 		end
 
+		local collide = (lastPhaseName == "jump")
 		for _, part in ipairs(character:GetDescendants()) do
 			if part:IsA("BasePart") then
-				part.CanCollide = false
+				part.CanCollide = collide
 			end
 		end
 	end))
